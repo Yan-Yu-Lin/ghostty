@@ -13,6 +13,7 @@ const cursor = @import("renderer/cursor.zig");
 const instrumentation = @import("renderer/instrumentation.zig");
 const message = @import("renderer/message.zig");
 const size = @import("renderer/size.zig");
+pub const animation = @import("renderer/animation.zig");
 pub const frame_lease = @import("renderer/frame_lease.zig");
 pub const external_frame = @import("renderer/external_frame.zig");
 pub const shadertoy = @import("renderer/shadertoy.zig");
@@ -126,6 +127,7 @@ test {
     // selected renderer is Metal.
     _ = OpenGL.Frame;
 
+    _ = animation;
     _ = cursor;
     _ = instrumentation;
     _ = message;
