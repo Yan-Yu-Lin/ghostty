@@ -920,6 +920,19 @@ palette: Palette = .{},
 /// the mouse is shown again when a new window, tab, or split is created.
 @"mouse-hide-while-typing": bool = false,
 
+/// Scroll the primary screen scrollback by pixels rather than whole lines.
+///
+/// When enabled, mouse and trackpad scroll events accumulate a sub-line
+/// pixel remainder that the renderer uses to shift the grid vertically,
+/// producing smooth (pixel-perfect) scrolling instead of the grid jumping
+/// a full row at a time. The viewport itself still advances one row at a
+/// time; only the sub-row remainder is applied as a render offset.
+///
+/// This only applies to the primary screen with scrollback history. The
+/// alternate screen (full-screen TUI applications) always scrolls by
+/// whole lines, as do mouse-reporting and alternate-scroll modes.
+@"pixel-scroll": bool = true,
+
 /// When to scroll the surface to the bottom. The format of this is a list of
 /// options to enable separated by commas. If you prefix an option with `no-`
 /// then it is disabled. If you omit an option, its default value is used.
