@@ -172,6 +172,81 @@ pub fn scrollAction(
         .snap;
 }
 
+/// The spring displacement, in rows, for an observed region scroll.
+///
+/// This is the sign convention of the whole feature, so it is worth
+/// deriving rather than asserting.
+///
+/// By the time the renderer observes a jump, the terminal grid ALREADY
+/// holds the post-scroll content. What the user last saw is the
+/// pre-scroll frame. The animation's job is to draw the new content at
+/// the OLD content's apparent position and then glide it to its real
+/// one, so the spring must start displaced by the amount that undoes
+/// the jump.
+///
+/// `jump_rows` is positive when content moved DOWN (insertLines, reverse
+/// index). Screen-space +Y is also down. So:
+///
+///   - Content moved UP one row (`jump_rows = -1`, the ordinary case of
+///     scrolling forward through a file): a line that was on row 5 is
+///     now on row 4. To put it back under the user's eye we draw it one
+///     row DOWN, i.e. a POSITIVE offset.
+///   - Content moved DOWN one row (`jump_rows = +1`): symmetric, a
+///     NEGATIVE offset.
+///
+/// The displacement is therefore the negation of the jump. Getting this
+/// backwards does not merely fail to animate: it shifts the content
+/// FURTHER in the direction it just travelled, doubling the visible
+/// jump, and then springs back — a lurch away and a rebound rather than
+/// a glide.
+pub fn springDisplacement(jump_rows: isize) f32 {
+    return -@as(f32, @floatFromInt(jump_rows));
+}
+
+test "spring displacement undoes the jump rather than repeating it" {
+    const testing = std.testing;
+
+    // Content moved up (scrolling forward): draw it lower, so positive.
+    try testing.expectEqual(@as(f32, 3), springDisplacement(-3));
+
+    // Content moved down (scrolling back): draw it higher, so negative.
+    try testing.expectEqual(@as(f32, -3), springDisplacement(3));
+
+    // No jump, no displacement.
+    try testing.expectEqual(@as(f32, 0), springDisplacement(0));
+
+    // The displacement always opposes the jump. This is the property
+    // that failed on device: same-sign displacement moves content
+    // further along its own direction of travel, which reads as a lurch
+    // away followed by a rebound.
+    for ([_]isize{ -8, -1, 1, 8 }) |jump| {
+        const d = springDisplacement(jump);
+        const j: f32 = @floatFromInt(jump);
+        try testing.expect(d * j < 0);
+        try testing.expectApproxEqAbs(@abs(j), @abs(d), 1e-6);
+    }
+}
+
+test "a glide converges on zero offset from the undo displacement" {
+    const testing = std.testing;
+
+    // End to end: the offset starts at the full undo of the jump (the
+    // content appears exactly where it was before) and decays to zero
+    // (the content is where it really is), never crossing to the far
+    // side, which is what a rebound would look like.
+    var spring: Spring = .{ .position = springDisplacement(-4) };
+    try testing.expectEqual(@as(f32, 4), spring.position);
+
+    var i: usize = 0;
+    while (i < 240 and spring.animating()) : (i += 1) {
+        _ = spring.update(1.0 / 120.0, 0.15, 1.0);
+        try testing.expect(spring.position >= 0);
+        try testing.expect(spring.position <= 4);
+    }
+    try testing.expect(!spring.animating());
+    try testing.expectEqual(@as(f32, 0), spring.position);
+}
+
 /// Test helper: a monotonic instant `ns` after an arbitrary origin.
 fn testInstant(ns: u64) std.time.Instant {
     // std.time.Instant's representation is platform-specific, so build
@@ -441,7 +516,10 @@ test "wheel scroll glides and a following keypress cancels it" {
         .now = testInstant(t),
         .last_wheel = testInstant(wheel_at),
     }));
-    spring.position += -3;
+    spring.position += springDisplacement(-3);
+
+    // Content moved up, so it is drawn lower and glides up into place.
+    try testing.expect(spring.position > 0);
 
     // Run a few frames. The glide is in flight and has not settled.
     for (0..4) |_| {
@@ -495,12 +573,15 @@ test "a flick of several wheel scrolls stacks into one glide" {
             .last_wheel = testInstant(t),
         }));
         const before = spring.position;
-        spring.position += -3;
+        spring.position += springDisplacement(-3);
         total += 3;
 
         // Each one adds to what is left rather than replacing it, so
-        // the motion reads as continuous.
-        try testing.expectApproxEqAbs(before - 3, spring.position, 1e-6);
+        // the motion reads as continuous. All three scrolls go the same
+        // way, so the offset stays on one side of zero throughout: it
+        // never crosses over, which is what a rebound would look like.
+        try testing.expectApproxEqAbs(before + 3, spring.position, 1e-6);
+        try testing.expect(spring.position > 0);
 
         for (0..2) |_| {
             _ = spring.update(frame, duration, 1.0);

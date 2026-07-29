@@ -2832,14 +2832,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     return;
                 },
 
-                // Displace the spring by the jump so the content is
-                // drawn where it was before the jump, then let the step
-                // below start moving it. Adding (rather than assigning)
-                // is what makes a flick of several scrolls read as one
-                // continuous motion instead of restarting each time.
+                // Displace the spring so the content is drawn where it
+                // was BEFORE the jump, then let the step below glide it
+                // to where it now actually is. The displacement opposes
+                // the jump; see `animation.springDisplacement`.
+                //
+                // Adding (rather than assigning) is what makes a flick
+                // of several scrolls read as one continuous motion
+                // instead of restarting each time.
                 .glide => {
-                    const jump: f32 = @floatFromInt(state.scroll_jump_rows);
-                    self.scroll_spring.position += jump;
+                    self.scroll_spring.position +=
+                        animation.springDisplacement(state.scroll_jump_rows);
                     self.scroll_animating = true;
                 },
 
