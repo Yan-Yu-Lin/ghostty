@@ -360,17 +360,6 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
-    /// The sub-line pixel remainder for pixel scrolling (`pixel-scroll`).
-    /// This is only used on the primary screen when scrollback exists.
-    ///
-    /// Range is `(-cell_height, 0]`: zero means the viewport is exactly
-    /// aligned to a row boundary, and a negative value means the content
-    /// should be drawn that many pixels higher than the row grid, i.e. we
-    /// are partway between the current viewport row and the one below it.
-    /// The renderer receives the negated (positive) value; see
-    /// `renderer.State.Mouse.pixel_scroll_offset_y`.
-    pixel_scroll_offset: f64 = 0,
-
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -5403,24 +5392,23 @@ fn applyPixelScroll(self: *Surface, delta: f64) void {
     const up: usize = bar.offset;
     const down: usize = bar.total -| bar.len -| bar.offset;
 
-    // Our accumulator is positive down to match the viewport, so scrolling
-    // up (positive delta) moves it negative.
+    // The renderer state holds the authoritative offset (as a positive
+    // distance below the row boundary); our accumulator is positive down
+    // to match the viewport, so both the stored value and the incoming
+    // delta are negated going in.
+    const current: f64 = -@as(f64, self.renderer_state.mouse.pixel_scroll_offset_y);
     const step = pixelScrollAccumulate(
-        self.mouse.pixel_scroll_offset - delta,
+        current - delta,
         cell_height,
         up,
         down,
     );
 
-    self.mouse.pixel_scroll_offset = step.remainder;
     if (step.rows != 0) {
         self.io.terminal.scrollViewport(.{ .delta = step.rows });
     }
 
-    // The renderer wants how far we are BELOW the row boundary as a
-    // positive number, so negate. Our accumulator is in (-cell_height, 0].
-    self.renderer_state.mouse.pixel_scroll_offset_y =
-        @floatCast(-self.mouse.pixel_scroll_offset);
+    self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(-step.remainder);
 }
 
 /// Clear any pending pixel scroll offset so the grid renders row-aligned.
@@ -5431,7 +5419,6 @@ fn applyPixelScroll(self: *Surface, delta: f64) void {
 ///
 /// Precondition: the renderer_state mutex must be held.
 fn resetPixelScroll(self: *Surface) void {
-    self.mouse.pixel_scroll_offset = 0;
     self.renderer_state.mouse.pixel_scroll_offset_y = 0;
 }
 
@@ -7389,6 +7376,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 defer self.renderer_state.mutex.unlock();
                 const t: *terminal.Terminal = self.renderer_state.terminal;
                 t.screens.active.scroll(.{ .row = n });
+                self.resetPixelScroll();
             }
 
             try self.queueRender();

@@ -801,6 +801,10 @@ pub fn scrollViewport(
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     self.terminal.scrollViewport(scroll);
+
+    // A viewport jump lands on a row boundary, so any sub-row pixel
+    // scroll offset from a previous mouse scroll is stale.
+    self.renderer_state.mouse.pixel_scroll_offset_y = 0;
 }
 
 /// Jump the viewport to the prompt.
@@ -809,6 +813,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+        self.renderer_state.mouse.pixel_scroll_offset_y = 0;
     }
 
     try self.renderer_wakeup.notify();
