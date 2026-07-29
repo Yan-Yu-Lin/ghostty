@@ -2396,3 +2396,187 @@ test "dirty row resets highlights" {
         try testing.expectEqual(0, row_highlights[0].items.len);
     }
 }
+
+test "extra rows are absent by default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..10) |i| {
+        s.nextSlice(&.{@as(u8, 'A') + @as(u8, @intCast(i))});
+        s.nextSlice("\r\n");
+    }
+    t.scrollViewport(.top);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // We never asked for them, so we never paid for them.
+    try testing.expect(!state.extra_rows.present(RenderState.ExtraRows.above_index));
+    try testing.expect(!state.extra_rows.present(RenderState.ExtraRows.below_index));
+
+    // And the row count is untouched, which is the whole point of keeping
+    // these off to the side.
+    try testing.expectEqual(3, state.rows);
+    try testing.expectEqual(3, state.row_data.len);
+}
+
+test "extra rows expose the rows just outside the viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    // Ten lines of scrollback, each identifiable by its first character.
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..10) |i| {
+        s.nextSlice(&.{@as(u8, 'A') + @as(u8, @intCast(i))});
+        s.nextSlice("\r\n");
+    }
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.pixel_scroll = true;
+
+    // Scroll to somewhere in the middle so there's content on both sides.
+    t.scrollViewport(.top);
+    t.scrollViewport(.{ .delta = 4 });
+    try state.update(alloc, &t);
+
+    const cells = state.row_data.items(.cells);
+    try testing.expectEqual(3, state.rows);
+    const top = cells[0].get(0).raw.codepoint();
+    const bottom = cells[2].get(0).raw.codepoint();
+
+    // The extra rows are the ones immediately before and after.
+    const above = RenderState.ExtraRows.above_index;
+    const below = RenderState.ExtraRows.below_index;
+    try testing.expect(state.extra_rows.present(above));
+    try testing.expect(state.extra_rows.present(below));
+
+    const extra = state.extra_rows.row_data.items(.cells);
+    try testing.expectEqual(top - 1, extra[above].get(0).raw.codepoint());
+    try testing.expectEqual(bottom + 1, extra[below].get(0).raw.codepoint());
+
+    // Extra rows are full rows, same as viewport rows.
+    try testing.expectEqual(10, extra[above].len);
+    try testing.expectEqual(10, extra[below].len);
+}
+
+test "extra row above is absent at the top of the scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..10) |i| {
+        s.nextSlice(&.{@as(u8, 'A') + @as(u8, @intCast(i))});
+        s.nextSlice("\r\n");
+    }
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.pixel_scroll = true;
+
+    t.scrollViewport(.top);
+    try state.update(alloc, &t);
+
+    // Nothing above the first row of scrollback. The renderer draws this
+    // as plain background rather than stale content.
+    try testing.expect(!state.extra_rows.present(RenderState.ExtraRows.above_index));
+    try testing.expect(state.extra_rows.present(RenderState.ExtraRows.below_index));
+}
+
+test "extra row below is absent at the bottom of the screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..10) |i| {
+        s.nextSlice(&.{@as(u8, 'A') + @as(u8, @intCast(i))});
+        s.nextSlice("\r\n");
+    }
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.pixel_scroll = true;
+
+    t.scrollViewport(.bottom);
+    try state.update(alloc, &t);
+
+    // At the bottom there's scrollback above us but nothing below.
+    try testing.expect(state.extra_rows.present(RenderState.ExtraRows.above_index));
+    try testing.expect(!state.extra_rows.present(RenderState.ExtraRows.below_index));
+}
+
+test "extra rows follow the viewport across updates" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..10) |i| {
+        s.nextSlice(&.{@as(u8, 'A') + @as(u8, @intCast(i))});
+        s.nextSlice("\r\n");
+    }
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.pixel_scroll = true;
+
+    const above = RenderState.ExtraRows.above_index;
+
+    t.scrollViewport(.top);
+    t.scrollViewport(.{ .delta = 4 });
+    try state.update(alloc, &t);
+    const first = state.extra_rows.row_data
+        .items(.cells)[above].get(0).raw.codepoint();
+
+    // A second update at a new scroll position must rebuild the extra
+    // rows, not leave the previous ones in place. These rows aren't in
+    // the viewport, so the normal per-row dirty tracking can't be relied
+    // on to notice they moved.
+    t.scrollViewport(.{ .delta = 1 });
+    try state.update(alloc, &t);
+    const second = state.extra_rows.row_data
+        .items(.cells)[above].get(0).raw.codepoint();
+
+    try testing.expectEqual(first + 1, second);
+}
