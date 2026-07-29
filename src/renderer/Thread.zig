@@ -1015,24 +1015,40 @@ fn setQosClass(self: *const Thread) void {
     }
 }
 
-fn syncDrawTimer(self: *Thread) void {
-    skip: {
-        // If our renderer supports animations and has them, then we
-        // can apply draw timer based on custom shader animation configuration.
-        if (@hasDecl(rendererpkg.Renderer, "hasAnimations") and
-            self.renderer.hasAnimations())
-        {
-            // If our config says to always animate, we do so.
-            switch (self.config.custom_shader_animation) {
-                // Always animate
-                .always => break :skip,
-                // Only when focused
-                .true => if (self.flags.focused) break :skip,
-                // Never animate
-                .false => {},
-            }
-        }
+/// Whether the draw timer should be running right now.
+fn drawTimerShouldRun(self: *const Thread) bool {
+    // A scroll glide needs frames unconditionally. It is not a
+    // decorative effect, so `custom-shader-animation` doesn't gate it,
+    // and it is self-limiting: the spring settles within
+    // `scroll-animation-duration` and clears this, at which point the
+    // timer stops on its next tick. Idle cost is zero.
+    if (@hasDecl(rendererpkg.Renderer, "hasScrollAnimation") and
+        self.renderer.hasScrollAnimation())
+    {
+        return true;
+    }
 
+    // If our renderer supports animations and has them, then we
+    // can apply draw timer based on custom shader animation configuration.
+    if (@hasDecl(rendererpkg.Renderer, "hasAnimations") and
+        self.renderer.hasAnimations())
+    {
+        // If our config says to always animate, we do so.
+        return switch (self.config.custom_shader_animation) {
+            // Always animate
+            .always => true,
+            // Only when focused
+            .true => self.flags.focused,
+            // Never animate
+            .false => false,
+        };
+    }
+
+    return false;
+}
+
+fn syncDrawTimer(self: *Thread) void {
+    if (!self.drawTimerShouldRun()) {
         // We're skipping the draw timer. Stop it on the next iteration.
         self.draw_active = false;
         return;
@@ -1524,6 +1540,14 @@ fn drawCallback(
     }
     _ = t.drawFrame(false);
 
+    // The draw above may have settled a scroll glide, which is the only
+    // reason the timer was running. Recheck so we stop instead of
+    // spinning at the draw interval forever. This is the disarm half of
+    // "zero idle cost": the flag is cleared by the frame that reaches
+    // the spring's rest position, and we observe it here immediately
+    // after.
+    if (t.draw_active and !t.drawTimerShouldRun()) t.draw_active = false;
+
     // Only continue if we're still active
     if (t.draw_active) {
         t.draw_h.run(&t.loop, &t.draw_c, DRAW_INTERVAL, Thread, t, drawCallback);
@@ -1560,6 +1584,12 @@ fn renderCallback(
 
     // Draw
     _ = t.drawFrame(false);
+
+    // The update may have started a scroll glide, which needs frames the
+    // terminal isn't going to ask for. This is the arm half of the draw
+    // timer; the timer's own callback owns the disarm. Cheap and
+    // idempotent when nothing is animating.
+    t.syncDrawTimer();
 
     return .disarm;
 }

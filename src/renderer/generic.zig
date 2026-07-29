@@ -12,6 +12,7 @@ const renderer = @import("../renderer.zig");
 const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
+const animation = @import("animation.zig");
 const cellpkg = @import("cell.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
@@ -166,6 +167,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// `renderer.State.Mouse.pixel_scroll_offset_y`. This is zero
         /// whenever pixel scrolling isn't currently in effect.
         pixel_scroll_offset: f32 = 0,
+
+        /// The in-flight alternate-screen scroll animation.
+        ///
+        /// The position is in terminal ROWS, not pixels, and is the
+        /// offset of where the content is drawn from where it actually
+        /// is: right after a jump it equals the jump, so the content is
+        /// drawn where it used to be, and it decays to zero as the
+        /// content glides into its real position. Zero means settled.
+        ///
+        /// Only ever non-zero on the alternate screen, and only for
+        /// scrolls the user made with a wheel or trackpad. See
+        /// `animation.scrollAction`.
+        scroll_spring: animation.Spring = .{},
+
+        /// Whether the scroll spring needs another frame. This is what
+        /// keeps the render thread's draw timer armed, so it must go
+        /// false the moment the spring settles or we burn 120Hz forever.
+        /// See `hasAnimations`.
+        scroll_animating: bool = false,
+
+        /// Whether the alternate screen was active on the most recent
+        /// frame. The uniform computation runs after the critical
+        /// section, so it can't ask the terminal.
+        alternate_screen: bool = false,
+
+        /// The scrolling region bounds from the most recent frame, in
+        /// viewport rows. Used to notice a bounds change, which
+        /// invalidates any in-flight glide.
+        scroll_region_top: terminal.size.CellCountInt = 0,
+        scroll_region_bottom: terminal.size.CellCountInt = 0,
+
+        /// When the spring was last stepped, so the next step knows how
+        /// much time to advance. Null when not animating.
+        last_scroll_frame_time: ?std.time.Instant = null,
 
         /// Tracks the last bottom-right pin of the screen to detect new output.
         /// When the final line changes (node or y differs), new content was added.
@@ -684,6 +719,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             macos_background_from_layer: bool,
             scroll_to_bottom_on_output: bool,
             pixel_scroll: bool,
+            scroll_animation_duration: f32,
+            scroll_animation_zeta: f32,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -760,6 +797,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .macos_background_from_layer = config.@"macos-background-from-layer",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .pixel_scroll = config.@"pixel-scroll",
+                    .scroll_animation_duration = @max(0, config.@"scroll-animation-duration"),
+                    // Bounciness maps to the spring's damping ratio.
+                    // 1.0 is critically damped (no overshoot); the 0.6
+                    // scale keeps a full-bounciness spring underdamped
+                    // but still settling promptly rather than ringing.
+                    .scroll_animation_zeta = 1.0 - (std.math.clamp(
+                        config.@"scroll-animation-bounciness",
+                        0,
+                        1,
+                    ) * 0.6),
                     .arena = arena,
                 };
             }
@@ -844,6 +891,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .pixel_scroll_offset_y = 0,
+                    .tui_scroll_offset_y = 0,
+                    .tui_scroll_region_top = 0,
+                    .tui_scroll_region_bottom = 0,
                     .min_contrast = options.config.min_contrast,
                     .cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) },
                     .cursor_color = undefined,
@@ -1149,8 +1199,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// True if our renderer has animations so that a higher frequency
         /// timer is used.
+        ///
+        /// The scroll spring rides on this rather than owning a timer of
+        /// its own: the render thread already arms and disarms its draw
+        /// timer from this answer (see `Thread.syncDrawTimer`), so a
+        /// settled spring costs exactly nothing. `scroll_animating` is
+        /// cleared the frame the spring reaches zero, and the renderer
+        /// wakes the thread once more so it can disarm.
         pub fn hasAnimations(self: *const Self) bool {
-            return self.has_custom_shaders;
+            return self.has_custom_shaders or self.scroll_animating;
+        }
+
+        /// True while a scroll glide still needs frames.
+        ///
+        /// Separate from `hasAnimations` because the render thread gates
+        /// that one behind `custom-shader-animation`, which is a
+        /// preference about decorative shaders and has nothing to say
+        /// about a scroll the user just made. A glide runs to
+        /// completion regardless; it is bounded by
+        /// `scroll-animation-duration` and then stops on its own.
+        pub fn hasScrollAnimation(self: *const Self) bool {
+            return self.scroll_animating;
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1190,6 +1259,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn setVisible(self: *Self, visible: bool) void {
+            // An occluded surface skips its draws entirely (see
+            // `Thread.drawFrame`), so a glide left in flight would never
+            // reach its rest position: the spring would stay displaced,
+            // hold the draw timer armed, and tick at the draw interval
+            // producing nothing. Snap instead. There is no visual cost —
+            // nobody is looking at the animation — and it restores the
+            // zero-idle-cost guarantee.
+            if (!visible) {
+                self.draw_mutex.lock();
+                defer self.draw_mutex.unlock();
+                self.snapScrollAnimation();
+            }
+
             // If we're not visible, then we want to stop the display link
             // because it is a waste of resources and we can move to pure
             // change-driven updates.
@@ -1241,6 +1323,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update relevant uniforms
             self.updateFontGridUniforms();
+
+            // The spring's offset is in rows but is rendered through the
+            // new cell height, so an in-flight glide would jump. Snap.
+            self.snapScrollAnimation();
 
             // Force a full rebuild, because cached rows may still reference
             // an outdated atlas from the old grid and this can cause garbage
@@ -1300,6 +1386,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
+
+                /// Whether the alternate screen is active. Read inside
+                /// the lock because the scroll animation decision runs
+                /// outside it and can't ask the terminal.
+                alternate: bool,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1472,6 +1563,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
+                    .alternate = state.terminal.screens.active_key == .alternate,
                 };
             };
 
@@ -1569,6 +1661,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
+
+                // Fold this frame's region scroll into the animation.
+                // Must happen before rebuildCells, which publishes the
+                // resulting uniforms.
+                self.updateScrollAnimation(critical.alternate, critical.mouse);
 
                 // Build our GPU cells
                 self.rebuildCells(
@@ -1711,12 +1808,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.size.screen.width != surface_size.width or
                 self.size.screen.height != surface_size.height;
 
+            // Advance the scroll glide before deciding whether to draw,
+            // so that the frame this animation settles on is still
+            // drawn (with a zero offset) rather than skipped, leaving
+            // the content one glide-offset out of place forever.
+            const was_scroll_animating = self.scroll_animating;
+            self.stepScrollAnimation();
+
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
             const needs_redraw =
                 size_changed or
                 self.cells_rebuilt or
                 self.hasAnimations() or
+                was_scroll_animating or
                 sync;
 
             if (!needs_redraw) {
@@ -2249,6 +2354,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.updateScreenSizeUniforms();
 
+            // A resize reflows the application's content, so an offset
+            // measured against the old layout means nothing. Snap.
+            self.snapScrollAnimation();
+
             log.debug("screen size size={}", .{size});
         }
 
@@ -2672,6 +2781,195 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return @max(@round(cell_h - offset), 1.0);
         }
 
+        /// Fold this frame's observed region scroll into the animation
+        /// spring, then step the spring forward.
+        ///
+        /// Runs once per `updateFrame`, outside the terminal critical
+        /// section but inside the draw mutex, before `rebuildCells`
+        /// publishes the resulting uniforms.
+        ///
+        /// Caller must hold the draw mutex.
+        fn updateScrollAnimation(
+            self: *Self,
+            alternate: bool,
+            mouse: renderer.State.Mouse,
+        ) void {
+            const state: *const terminal.RenderState = &self.terminal_state;
+
+            // A screen switch is a region change by definition: the two
+            // screens have unrelated regions, and the render state
+            // reports no jump across the switch anyway.
+            const region_changed =
+                alternate != self.alternate_screen or
+                state.scroll_region_top != self.scroll_region_top or
+                state.scroll_region_bottom != self.scroll_region_bottom;
+
+            self.alternate_screen = alternate;
+            self.scroll_region_top = state.scroll_region_top;
+            self.scroll_region_bottom = state.scroll_region_bottom;
+
+            const now = std.time.Instant.now() catch {
+                // Without a clock we can neither judge wheel recency nor
+                // step the spring, so the only correct behavior is the
+                // un-animated one.
+                self.snapScrollAnimation();
+                return;
+            };
+
+            switch (animation.scrollAction(.{
+                .alternate = alternate,
+                .duration = self.config.scroll_animation_duration,
+                .jump_rows = state.scroll_jump_rows,
+                .region_changed = region_changed,
+                .now = now,
+                .last_wheel = mouse.last_wheel_scroll,
+            })) {
+                // Snapping is what makes keyboard scrolling instant: it
+                // discards the in-flight glide as well as this frame's
+                // jump, so the content is drawn where it actually is.
+                .snap => {
+                    self.snapScrollAnimation();
+                    return;
+                },
+
+                // Displace the spring by the jump so the content is
+                // drawn where it was before the jump, then let the step
+                // below start moving it. Adding (rather than assigning)
+                // is what makes a flick of several scrolls read as one
+                // continuous motion instead of restarting each time.
+                .glide => {
+                    const jump: f32 = @floatFromInt(state.scroll_jump_rows);
+                    self.scroll_spring.position += jump;
+                    self.scroll_animating = true;
+                },
+
+                .none => {},
+            }
+
+            if (!self.scroll_animating) return;
+
+            // Never glide by more than the region is tall. Beyond that
+            // the content being animated from is entirely off-region and
+            // clipped away, so a larger offset only delays the settle.
+            const region_rows: f32 = @floatFromInt(
+                @as(u32, self.scroll_region_bottom -| self.scroll_region_top) + 1,
+            );
+            self.scroll_spring.position = std.math.clamp(
+                self.scroll_spring.position,
+                -region_rows,
+                region_rows,
+            );
+        }
+
+        /// Advance the scroll animation by however long it has been
+        /// since the last frame.
+        ///
+        /// This runs in `drawFrame` rather than `updateFrame` because
+        /// draws are what happen at display rate: `updateFrame` only
+        /// runs when the terminal changes, and a glide has to keep
+        /// moving after the application has stopped sending anything.
+        ///
+        /// Caller must hold the draw mutex.
+        fn stepScrollAnimation(self: *Self) void {
+            if (!self.scroll_animating) return;
+
+            const now = std.time.Instant.now() catch {
+                self.snapScrollAnimation();
+                return;
+            };
+
+            const dt: f32 = dt: {
+                // First frame of this animation: assume one frame at a
+                // typical refresh rate rather than zero, so the glide
+                // starts moving immediately.
+                const last = self.last_scroll_frame_time orelse
+                    break :dt 1.0 / 60.0;
+                if (now.order(last) == .lt) break :dt 0;
+                const ns: f32 = @floatFromInt(now.since(last));
+                // Cap the step so a renderer that was stalled (an
+                // occluded surface, a long pause) resumes by gliding
+                // rather than by teleporting through the animation.
+                break :dt @min(ns / std.time.ns_per_s, 0.1);
+            };
+            self.last_scroll_frame_time = now;
+
+            self.scroll_animating = self.scroll_spring.update(
+                dt,
+                self.config.scroll_animation_duration,
+                self.config.scroll_animation_zeta,
+            );
+
+            // The spring settled on this frame. Drop the frame time so
+            // the next animation measures from its own first frame
+            // rather than from however long the surface sat idle.
+            if (!self.scroll_animating) self.last_scroll_frame_time = null;
+
+            self.publishScrollAnimationUniforms();
+        }
+
+        /// Cancel any scroll animation and draw content where it is.
+        ///
+        /// Caller must hold the draw mutex.
+        fn snapScrollAnimation(self: *Self) void {
+            self.scroll_spring.reset();
+            self.scroll_animating = false;
+            self.last_scroll_frame_time = null;
+            self.publishScrollAnimationUniforms();
+        }
+
+        /// Write the current scroll animation state into the uniforms.
+        ///
+        /// Caller must hold the draw mutex.
+        fn publishScrollAnimationUniforms(self: *Self) void {
+            const v = self.scrollAnimationUniforms();
+            self.uniforms.tui_scroll_offset_y = v.offset_y;
+            self.uniforms.tui_scroll_region_top = v.top;
+            self.uniforms.tui_scroll_region_bottom = v.bottom;
+        }
+
+        /// Compute the scroll-region animation uniforms for this frame.
+        ///
+        /// Returns the pixel offset plus the region bounds in cell
+        /// BUFFER rows, which is where the shaders index. Under pixel
+        /// scrolling the buffer has an extra row at the top, so a
+        /// viewport row `y` lives at buffer row `y + 1`; see
+        /// `rebuildCells`.
+        ///
+        /// Caller must hold the draw mutex.
+        fn scrollAnimationUniforms(self: *const Self) struct {
+            offset_y: f32,
+            top: u16,
+            bottom: u16,
+        } {
+            const none: @TypeOf(scrollAnimationUniforms(self)) = .{
+                .offset_y = 0,
+                .top = 0,
+                .bottom = 0,
+            };
+
+            if (!self.scroll_spring.animating()) return none;
+            if (!self.alternate_screen) return none;
+
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+
+            // Snap to whole pixels for the same reason the grid shift
+            // does: a fractional offset resamples glyphs differently
+            // every frame and makes moving text shimmer.
+            const offset_y = @round(self.scroll_spring.position * cell_h);
+
+            // A sub-pixel offset rounds to zero, which the shaders read
+            // as "no animation". Report none rather than leaving the
+            // bounds set with a zero offset.
+            if (offset_y == 0) return none;
+
+            const row_offset: u16 = if (self.pixelScrollRows()) 1 else 0;
+            return .{
+                .offset_y = offset_y,
+                .top = @as(u16, @intCast(self.scroll_region_top)) + row_offset,
+                .bottom = @as(u16, @intCast(self.scroll_region_bottom)) + row_offset,
+            };
+        }
+
         fn rebuildCells(
             self: *Self,
             preedit: ?renderer.State.Preedit,
@@ -3039,6 +3337,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Publish the grid shift for this frame.
             self.uniforms.pixel_scroll_offset_y = self.pixelScrollUniform();
+
+            // Publish the scroll-region animation for this frame. The
+            // draw path republishes this every frame as the spring
+            // steps; this covers the frames where the offset changed
+            // because a jump arrived rather than because time passed.
+            self.publishScrollAnimationUniforms();
 
             // Update that our cells rebuilt
             self.cells_rebuilt = true;

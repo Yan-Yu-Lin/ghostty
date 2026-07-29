@@ -933,6 +933,27 @@ palette: Palette = .{},
 /// whole lines, as do mouse-reporting and alternate-scroll modes.
 @"pixel-scroll": bool = true,
 
+/// How long, in seconds, a scroll inside a full-screen application (nvim,
+/// less, htop, ...) takes to glide into place. Set to 0 to disable the
+/// animation and scroll instantly.
+///
+/// Unlike `pixel-scroll`, which is driven directly by the scroll device on
+/// the primary screen, the alternate screen has no viewport to move: the
+/// application redraws its scrolling region in place. There is nothing
+/// continuous to follow, so instead the renderer animates each whole-row
+/// jump the application makes.
+///
+/// This ONLY applies to scrolls the user made with a wheel or trackpad.
+/// Scrolling driven by the keyboard (j/k, Ctrl-D, gg, ...) always snaps
+/// instantly, and cancels any glide already in flight.
+@"scroll-animation-duration": f32 = 0.15,
+
+/// How much a scroll animation overshoots and springs back, from 0 (no
+/// overshoot at all) to 1.
+///
+/// Only has an effect when `scroll-animation-duration` is greater than 0.
+@"scroll-animation-bounciness": f32 = 0.0,
+
 /// When to scroll the surface to the bottom. The format of this is a list of
 /// options to enable separated by commas. If you prefix an option with `no-`
 /// then it is disabled. If you omit an option, its default value is used.
