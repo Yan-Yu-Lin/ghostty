@@ -239,6 +239,25 @@ pub const Uniforms = extern struct {
     /// `(0, 2 * cell_height]` while scrolling.
     pixel_scroll_offset_y: f32 align(4),
 
+    /// The vertical pixel offset applied on top of
+    /// `pixel_scroll_offset_y` to rows inside the scrolling region, for
+    /// animating an alternate-screen scroll. See `Renderer.scroll_spring`.
+    ///
+    /// Zero means no animation is in flight and the region bounds below
+    /// are meaningless. A non-zero value shifts rows in
+    /// `[tui_scroll_region_top, tui_scroll_region_bottom]` (in cell
+    /// BUFFER rows, so already adjusted for the extra top row) DOWN by
+    /// this many pixels, back toward where the content was before the
+    /// jump, and decays to zero. Rows outside the region — a
+    /// statusline, a header — do not move, and content that would glide
+    /// out of the region is clipped at its boundaries.
+    tui_scroll_offset_y: f32 align(4),
+
+    /// Inclusive bounds of the scrolling region in cell buffer rows.
+    /// Only meaningful when `tui_scroll_offset_y` is non-zero.
+    tui_scroll_region_top: u16 align(2),
+    tui_scroll_region_bottom: u16 align(2),
+
     /// Various booleans.
     ///
     /// TODO: Maybe put these in a packed struct, like for OpenGL.
@@ -474,7 +493,7 @@ fn checkError(err_: ?*anyopaque) !void {
 test "Uniforms layout matches the MSL definition" {
     const testing = std.testing;
 
-    try testing.expectEqual(144, @sizeOf(Uniforms));
+    try testing.expectEqual(160, @sizeOf(Uniforms));
     try testing.expectEqual(0, @offsetOf(Uniforms, "projection_matrix"));
     try testing.expectEqual(64, @offsetOf(Uniforms, "screen_size"));
     try testing.expectEqual(72, @offsetOf(Uniforms, "cell_size"));
@@ -486,5 +505,8 @@ test "Uniforms layout matches the MSL definition" {
     try testing.expectEqual(124, @offsetOf(Uniforms, "cursor_color"));
     try testing.expectEqual(128, @offsetOf(Uniforms, "bg_color"));
     try testing.expectEqual(132, @offsetOf(Uniforms, "pixel_scroll_offset_y"));
-    try testing.expectEqual(136, @offsetOf(Uniforms, "bools"));
+    try testing.expectEqual(136, @offsetOf(Uniforms, "tui_scroll_offset_y"));
+    try testing.expectEqual(140, @offsetOf(Uniforms, "tui_scroll_region_top"));
+    try testing.expectEqual(142, @offsetOf(Uniforms, "tui_scroll_region_bottom"));
+    try testing.expectEqual(144, @offsetOf(Uniforms, "bools"));
 }

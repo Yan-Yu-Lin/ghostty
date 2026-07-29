@@ -200,6 +200,19 @@ pub const Uniforms = extern struct {
     /// it unconditionally. See the Metal Uniforms for the semantics.
     pixel_scroll_offset_y: f32 align(4) = 0,
 
+    /// The scroll-region animation offset and bounds. As with
+    /// `pixel_scroll_offset_y`, the GLSL shaders do not implement this,
+    /// so these are always zero for OpenGL; they exist so the renderer
+    /// can set them unconditionally. See the Metal Uniforms for the
+    /// semantics.
+    ///
+    /// The bounds are `u32` rather than the Metal side's `u16` because
+    /// std140 has no 16-bit integer type. That is fine: this struct is
+    /// matched against the GLSL block, not against the Metal one.
+    tui_scroll_offset_y: f32 align(4) = 0,
+    tui_scroll_region_top: u32 align(4) = 0,
+    tui_scroll_region_bottom: u32 align(4) = 0,
+
     /// Various booleans, in a packed struct for space efficiency.
     bools: Bools align(4),
 

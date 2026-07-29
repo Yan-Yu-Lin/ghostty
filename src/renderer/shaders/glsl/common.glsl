@@ -26,6 +26,13 @@ layout(binding = 1, std140) uniform Globals {
     // implement pixel scrolling, so this is always zero; it is declared
     // only to keep this block's layout matching the Zig Uniforms struct.
     uniform float pixel_scroll_offset_y;
+    // Scroll-region animation offset and bounds. As with
+    // pixel_scroll_offset_y these are always zero on the GLSL path and
+    // exist only to keep this block's layout matching the Zig Uniforms
+    // struct.
+    uniform float tui_scroll_offset_y;
+    uniform uint tui_scroll_region_top;
+    uniform uint tui_scroll_region_bottom;
     uniform uint bools;
 };
 

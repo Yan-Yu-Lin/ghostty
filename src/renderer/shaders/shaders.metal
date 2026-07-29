@@ -24,6 +24,13 @@ struct Uniforms {
   // means grid_size.y includes one extra row at each end and everything
   // is shifted up by this many pixels. See the Zig Uniforms struct.
   float pixel_scroll_offset_y;
+  // Extra shift applied to rows inside the scrolling region, for
+  // animating an alternate-screen scroll. Zero means no animation and
+  // the region bounds are meaningless. The bounds are in cell BUFFER
+  // rows (already adjusted for the extra top row). See the Zig struct.
+  float tui_scroll_offset_y;
+  ushort tui_scroll_region_top;
+  ushort tui_scroll_region_bottom;
   bool cursor_wide;
   bool use_display_p3;
   bool use_linear_blending;
@@ -477,6 +484,32 @@ fragment float4 cell_bg_fragment(
   scrolled_pos.y += uniforms.pixel_scroll_offset_y;
   int2 grid_pos = int2(floor((scrolled_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
 
+  // Scroll region animation. Content inside the region is drawn shifted
+  // DOWN by tui_scroll_offset_y (back toward where it was before the
+  // jump), so a fragment inside the region's band samples from that far
+  // UP the buffer. This is the gather side of the same shift the text
+  // vertex applies, hence the opposite sign.
+  //
+  // The band is decided by the fragment's own row, not by the row it
+  // ends up sampling: the region occupies a fixed set of screen rows,
+  // and only what is drawn inside those rows moves.
+  if (uniforms.tui_scroll_offset_y != 0.0 &&
+      grid_pos.y >= int(uniforms.tui_scroll_region_top) &&
+      grid_pos.y <= int(uniforms.tui_scroll_region_bottom)) {
+    const int shifted_row = int(floor(
+      (scrolled_pos.y - uniforms.tui_scroll_offset_y - uniforms.grid_padding.x) /
+        uniforms.cell_size.y
+    ));
+    // Clamp rather than letting the sample walk out of the region: the
+    // rows just outside it are fixed chrome (a statusline, a header)
+    // and must never be dragged into the scrolling area.
+    grid_pos.y = clamp(
+      shifted_row,
+      int(uniforms.tui_scroll_region_top),
+      int(uniforms.tui_scroll_region_bottom)
+    );
+  }
+
   // Whether the fragment is in the vertical padding. This is a question
   // about where the fragment is on screen, not about what it samples, so
   // it uses the unshifted position against the visible row count.
@@ -590,6 +623,9 @@ struct CellTextVertexOut {
   float4 color [[flat]];
   float4 bg_color [[flat]];
   float2 tex_coord;
+  // Whether this glyph's cell is inside the animating scroll region, so
+  // the fragment stage knows to clip it at the region's boundaries.
+  bool in_scroll_region [[flat]];
 };
 
 vertex CellTextVertexOut cell_text_vertex(
@@ -656,6 +692,17 @@ vertex CellTextVertexOut cell_text_vertex(
   // Calculate the final position of the cell which uses our glyph size
   // and glyph offset to create the correct bounding box for the glyph.
   cell_pos = cell_pos + size * corner + offset;
+
+  // Apply the scroll region animation. Rows inside the region are drawn
+  // shifted DOWN toward where they were before the jump; rows outside it
+  // (a statusline, a header) never move.
+  out.in_scroll_region =
+    uniforms.tui_scroll_offset_y != 0.0 &&
+    in.grid_pos.y >= uniforms.tui_scroll_region_top &&
+    in.grid_pos.y <= uniforms.tui_scroll_region_bottom;
+  if (out.in_scroll_region) {
+    cell_pos.y += uniforms.tui_scroll_offset_y;
+  }
 
   // Apply the pixel scroll shift, moving the whole grid up. Snap to whole
   // pixels afterwards: the offset is already integral, but the glyph
@@ -738,6 +785,27 @@ fragment float4 cell_text_fragment(
     const float grid_bottom =
       grid_top + float(int(uniforms.grid_size.y) - 2) * uniforms.cell_size.y;
     if (in.position.y < grid_top || in.position.y >= grid_bottom) {
+      discard_fragment();
+    }
+  }
+
+  // A glyph gliding with the scroll region can reach past the region's
+  // edge, where it would draw over fixed chrome (a statusline, a
+  // header). Clip it at the region's pixel bounds.
+  //
+  // Those bounds are in screen space, so we undo the grid shift that the
+  // vertex stage applied to get there: buffer row R occupies the band
+  // starting at grid_padding.x + R * cell_size.y - pixel_scroll_offset_y.
+  if (in.in_scroll_region) {
+    const float region_top =
+      uniforms.grid_padding.x +
+      float(uniforms.tui_scroll_region_top) * uniforms.cell_size.y -
+      uniforms.pixel_scroll_offset_y;
+    const float region_bottom =
+      uniforms.grid_padding.x +
+      float(int(uniforms.tui_scroll_region_bottom) + 1) * uniforms.cell_size.y -
+      uniforms.pixel_scroll_offset_y;
+    if (in.position.y < region_top || in.position.y >= region_bottom) {
       discard_fragment();
     }
   }
@@ -883,6 +951,19 @@ vertex ImageVertexOut image_vertex(
   // adds the source rect width/height components.
   float2 image_pos = (uniforms.cell_size * in.grid_pos) + in.cell_offset;
   image_pos += in.dest_size * corner;
+
+  // Images sit in grid coordinates, so they glide with the scroll
+  // region for the same reason text does. Unlike text they are not
+  // clipped at the region boundary: an image spans many rows, so the
+  // region test is about where it starts, and clipping the parts that
+  // reach outside would need a per-fragment test the image fragment
+  // shader has no bounds for. Kitty graphics inside an animating
+  // alternate-screen scroll region are rare enough to accept this.
+  if (uniforms.tui_scroll_offset_y != 0.0 &&
+      in.grid_pos.y >= float(uniforms.tui_scroll_region_top) &&
+      in.grid_pos.y <= float(uniforms.tui_scroll_region_bottom)) {
+    image_pos.y += uniforms.tui_scroll_offset_y;
+  }
 
   // Images are placed in grid coordinates, so they move with the grid
   // under pixel scrolling.
