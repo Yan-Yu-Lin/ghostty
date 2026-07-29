@@ -126,6 +126,23 @@ pub const Mouse = struct {
     ///
     /// See `Surface.Mouse.pixel_scroll_offset` for the producer side.
     pixel_scroll_offset_y: f32 = 0,
+
+    /// When the surface last delivered a wheel or trackpad scroll to the
+    /// terminal application, or null if it never has.
+    ///
+    /// The renderer animates a TUI's scroll only when the scroll came
+    /// from a scroll device: keyboard-driven motion (j/k, Ctrl-D) has to
+    /// stay instant. We can't tell those apart at the point the jump is
+    /// observed, because both arrive as the same region scroll, so the
+    /// surface timestamps the wheel events and the renderer treats a jump
+    /// as wheel-driven only if one landed within the last
+    /// `renderer.wheel_recency_window_ns`.
+    ///
+    /// A timestamp rather than a flag: the renderer reads this when it
+    /// happens to build a frame, not when the event arrives, so it needs
+    /// to judge recency itself. A flag would need a consumer to clear it
+    /// and would go stale between frames.
+    last_wheel_scroll: ?std.time.Instant = null,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.

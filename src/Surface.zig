@@ -5281,6 +5281,12 @@ pub fn scrollCallback(
             self.io.terminal.modes.get(.mouse_alternate_scroll))
         {
             if (y.delta != 0) {
+                // These arrow keys are indistinguishable from the real
+                // thing at the other end of the pty, so record that they
+                // came from a scroll device before sending them. See
+                // `recordWheelScroll`.
+                self.recordWheelScroll();
+
                 // When we send mouse events as cursor keys we always
                 // clear the selection.
                 try self.setSelection(null);
@@ -5312,6 +5318,11 @@ pub fn scrollCallback(
 
         // If we're scrolling up or down, then send a mouse event.
         if (self.isMouseReporting()) {
+            // The application will scroll its own region in response to
+            // these, which the renderer sees as an unattributed jump.
+            // Record that a scroll device caused it.
+            if (y.delta != 0) self.recordWheelScroll();
+
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 self.mouseReport(switch (y.direction()) {
@@ -5420,6 +5431,21 @@ fn applyPixelScroll(self: *Surface, delta: f64) void {
 /// Precondition: the renderer_state mutex must be held.
 fn resetPixelScroll(self: *Surface) void {
     self.renderer_state.mouse.pixel_scroll_offset_y = 0;
+}
+
+/// Record that a wheel or trackpad scroll is being delivered to the
+/// terminal application right now.
+///
+/// Both paths that hand a scroll to the application (mouse reporting and
+/// alternate-scroll arrow keys) call this. From the application's point of
+/// view the alternate-scroll path IS the keyboard, but from the user's it
+/// is the trackpad, and the user is who the animation is for.
+///
+/// See `renderer.State.Mouse.last_wheel_scroll` for the consumer side.
+///
+/// Precondition: the renderer_state mutex must be held.
+fn recordWheelScroll(self: *Surface) void {
+    self.renderer_state.mouse.last_wheel_scroll = std.time.Instant.now() catch return;
 }
 
 /// The result of accumulating a pixel scroll delta: how many whole rows
