@@ -44,6 +44,18 @@ pages: PageList,
 /// we can always have an active screen.
 no_scrollback: bool = false,
 
+/// Running total of rows that content has been shifted within the
+/// scrolling region, positive when content moved DOWN (insertLines,
+/// reverse index) and negative when it moved UP (deleteLines, index at
+/// the region bottom).
+///
+/// This is only ever read as a difference between two updates, so its
+/// absolute value is meaningless and wrapping is harmless. It exists so
+/// the renderer can tell that a TUI scrolled its region, and by how many
+/// rows, without diffing screen contents. See
+/// `RenderState.scroll_jump_rows`.
+scroll_tracker: isize = 0,
+
 /// The current cursor position
 cursor: Cursor,
 

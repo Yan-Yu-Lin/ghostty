@@ -119,6 +119,31 @@ pub const RenderState = struct {
     /// Only populated when `pixel_scroll` is set.
     extra_rows: ExtraRows = .empty,
 
+    /// How many rows content shifted within the scrolling region since the
+    /// previous update, positive down. Zero when nothing scrolled.
+    ///
+    /// A TUI on the alternate screen scrolls by rewriting the region in
+    /// place, so there is no viewport movement to observe; this is how a
+    /// renderer learns that the region moved and by how much. See
+    /// `Screen.scroll_tracker`.
+    ///
+    /// This is always zero on the first update for a screen (there is no
+    /// previous value to compare against) and across a screen switch,
+    /// because the two screens keep independent counters.
+    scroll_jump_rows: isize = 0,
+
+    /// The scrolling region of the terminal, in viewport rows, inclusive
+    /// on both ends. Captured alongside `scroll_jump_rows` because a
+    /// renderer animating the jump has to know which rows moved: the
+    /// rows outside the region (a statusline, a header) did not.
+    scroll_region_top: size.CellCountInt = 0,
+    scroll_region_bottom: size.CellCountInt = 0,
+
+    /// The `Screen.scroll_tracker` value at the previous update, used to
+    /// compute `scroll_jump_rows`. Null before the first update of a
+    /// screen.
+    last_scroll_tracker: ?isize = null,
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -460,6 +485,23 @@ pub const RenderState = struct {
 
             break :redraw false;
         };
+
+        // How far the scrolling region moved since the last update. The
+        // tracker is per-screen and wraps, so we compare against the
+        // value we stored for THIS screen and take the wrapping
+        // difference. A screen switch (below) clears the stored value,
+        // which reports no jump rather than a jump the size of the gap
+        // between two unrelated counters.
+        self.scroll_jump_rows = if (t.screens.active_key == self.screen)
+            if (self.last_scroll_tracker) |last|
+                s.scroll_tracker -% last
+            else
+                0
+        else
+            0;
+        self.last_scroll_tracker = s.scroll_tracker;
+        self.scroll_region_top = t.scrolling_region.top;
+        self.scroll_region_bottom = t.scrolling_region.bottom;
 
         // Always set our cheap fields, its more expensive to compare
         self.rows = s.pages.rows;
@@ -2579,4 +2621,203 @@ test "extra rows follow the viewport across updates" {
         .items(.cells)[above].get(0).raw.codepoint();
 
     try testing.expectEqual(first + 1, second);
+}
+
+test "scroll jump reports rows shifted by the alternate screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 5,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    _ = try t.switchScreen(.alternate);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+
+    // First update establishes a baseline; there is nothing to compare
+    // against so it reports no jump even though the screen just changed.
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, 0), state.scroll_jump_rows);
+
+    // A frame with no scrolling reports no jump.
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, 0), state.scroll_jump_rows);
+
+    // Content moving up is negative.
+    t.setCursorPos(1, 1);
+    t.deleteLines(2);
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, -2), state.scroll_jump_rows);
+
+    // And is consumed: the next frame is back to zero.
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, 0), state.scroll_jump_rows);
+
+    // Content moving down is positive.
+    t.setCursorPos(1, 1);
+    t.insertLines(3);
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, 3), state.scroll_jump_rows);
+}
+
+test "scroll jump accumulates several shifts between updates" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 5,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    _ = try t.switchScreen(.alternate);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // A burst of scrolling between two frames is reported as its net
+    // total, not as the last one or as several separate jumps. This is
+    // what lets a fast scroll read as one motion.
+    t.setCursorPos(1, 1);
+    t.deleteLines(1);
+    t.setCursorPos(1, 1);
+    t.deleteLines(1);
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, -1), state.scroll_jump_rows);
+}
+
+test "scroll jump reports nothing across a screen switch" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 5,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+
+    // Move the primary screen's counter well away from zero so that a
+    // naive diff across the switch would report a large bogus jump.
+    try state.update(alloc, &t);
+    t.setCursorPos(1, 1);
+    t.deleteLines(3);
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, -3), state.scroll_jump_rows);
+
+    // The alternate screen has its own counter, so the first update
+    // after the switch has no comparable previous value.
+    _ = try t.switchScreen(.alternate);
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, 0), state.scroll_jump_rows);
+
+    // And switching back is the same story in reverse.
+    t.setCursorPos(1, 1);
+    t.deleteLines(1);
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, -1), state.scroll_jump_rows);
+
+    _ = try t.switchScreen(.primary);
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, 0), state.scroll_jump_rows);
+}
+
+test "scroll region bounds are captured with the jump" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 10,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    _ = try t.switchScreen(.alternate);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // Default region is the whole screen.
+    try testing.expectEqual(@as(size.CellCountInt, 0), state.scroll_region_top);
+    try testing.expectEqual(@as(size.CellCountInt, 9), state.scroll_region_bottom);
+
+    // A TUI reserving a statusline shrinks it. This is what tells a
+    // renderer which rows may glide and which must stay put.
+    t.setTopAndBottomMargin(2, 8);
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(size.CellCountInt, 1), state.scroll_region_top);
+    try testing.expectEqual(@as(size.CellCountInt, 7), state.scroll_region_bottom);
+}
+
+test "index at the region bottom reports a jump" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 10,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    _ = try t.switchScreen(.alternate);
+    t.setTopAndBottomMargin(2, 8);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // A line feed at the bottom of a scrolling region scrolls the
+    // region rather than moving the cursor. This is the path a TUI
+    // takes when it scrolls by one line, and it must be counted.
+    t.setCursorPos(8, 1);
+    try t.index();
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, -1), state.scroll_jump_rows);
+
+    // A line feed anywhere else just moves the cursor and is not a
+    // scroll, so it must NOT be counted.
+    t.setCursorPos(4, 1);
+    try t.index();
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, 0), state.scroll_jump_rows);
+}
+
+test "reverse index at the region top reports a jump" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 10,
+        .max_scrollback = 100,
+    });
+    defer t.deinit(alloc);
+
+    _ = try t.switchScreen(.alternate);
+    t.setTopAndBottomMargin(2, 8);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // Scrolling backwards moves content down: positive.
+    t.setCursorPos(2, 1);
+    t.reverseIndex();
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(isize, 1), state.scroll_jump_rows);
 }

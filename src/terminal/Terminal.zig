@@ -2048,11 +2048,13 @@ pub fn index(self: *Terminal) !void {
             (!screen.no_scrollback or
                 self.scrolling_region.bottom == 0))
         {
+            screen.scroll_tracker -%= 1;
             try screen.cursorScrollAbove();
             return;
         }
 
         // Slow path for left and right scrolling region margins.
+        // scrollUp records the shift itself.
         if (self.scrolling_region.left != 0 or
             self.scrolling_region.right != self.cols - 1)
         {
@@ -2062,6 +2064,7 @@ pub fn index(self: *Terminal) !void {
 
         // Otherwise use a fast path function to efficiently scroll
         // the contents of the scrolling region.
+        screen.scroll_tracker -%= 1;
         try screen.cursorScrollRegionUp(
             self.scrolling_region.bottom - self.scrolling_region.top,
         );
@@ -2244,6 +2247,10 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
         // Clamp count to the scroll region height.
         const region_height = self.scrolling_region.bottom + 1;
         const adjusted_count = @min(count, region_height);
+
+        // Record the shift. This path bypasses deleteLines, which is
+        // where the rest of the scroll-up cases are counted.
+        self.screens.active.scroll_tracker -%= @intCast(adjusted_count);
 
         // TODO: Create an optimized version that can scroll N times
         // This isn't critical because in most cases, scrollUp is used
@@ -2532,6 +2539,9 @@ pub fn insertLines(self: *Terminal, count: usize) void {
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
 
+    // Record the shift for smooth scrolling. Content moves down.
+    self.screens.active.scroll_tracker +%= @intCast(adjusted_count);
+
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
     var cur_p = self.screens.active.pages.trackPin(
@@ -2731,6 +2741,9 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
     // We can only insert lines up to our remaining lines in the scroll
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
+
+    // Record the shift for smooth scrolling. Content moves up.
+    self.screens.active.scroll_tracker -%= @intCast(adjusted_count);
 
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
