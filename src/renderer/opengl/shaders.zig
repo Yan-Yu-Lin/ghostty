@@ -194,6 +194,12 @@ pub const Uniforms = extern struct {
     /// The background color for the whole surface.
     bg_color: [4]u8 align(4),
 
+    /// The vertical pixel offset to shift the grid by, for pixel
+    /// scrolling. The GLSL shaders do not implement pixel scrolling, so
+    /// this is always zero for OpenGL; it exists so the renderer can set
+    /// it unconditionally. See the Metal Uniforms for the semantics.
+    pixel_scroll_offset_y: f32 align(4) = 0,
+
     /// Various booleans, in a packed struct for space efficiency.
     bools: Bools align(4),
 
