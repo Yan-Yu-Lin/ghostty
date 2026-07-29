@@ -152,6 +152,15 @@ pub const RenderState = struct {
     /// values for comparison.
     viewport_pin: ?PageList.Pin = null,
 
+    /// Whether to populate `extra_rows`. This is set by the caller before
+    /// `beginUpdate` and is off by default so that the extra work is only
+    /// paid for by renderers that need it.
+    pixel_scroll: bool = false,
+
+    /// The rows immediately above and below the viewport. See `ExtraRows`.
+    /// Only populated when `pixel_scroll` is set.
+    extra_rows: ExtraRows = .empty,
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -189,6 +198,67 @@ pub const RenderState = struct {
         .row_data = .empty,
         .dirty = .false,
         .screen = .primary,
+    };
+
+    /// The rows immediately above and below the viewport.
+    ///
+    /// Pixel scrolling shifts the whole grid by a sub-cell amount, which
+    /// exposes up to one row of content past either edge of the viewport.
+    /// Rather than growing `rows` (which is part of our public contract and
+    /// has many non-renderer consumers), we keep these two rows off to the
+    /// side. A renderer that wants them can draw them into the padding
+    /// bands it creates by shifting; every other consumer is unaffected.
+    ///
+    /// A row is "absent" when there is nothing there in the terminal: the
+    /// viewport is at the top of scrollback (no `above`) or at the bottom
+    /// of the screen (no `below`). An absent row must be rendered as plain
+    /// background, never as stale content.
+    pub const ExtraRows = struct {
+        /// Row data for the extra rows. Either empty (never populated) or
+        /// exactly `len` entries: index `above_index` is the row above the
+        /// viewport and `below_index` is the row below it. An entry is only
+        /// valid if the matching `pins` entry is non-null.
+        row_data: std.MultiArrayList(Row) = .empty,
+
+        /// The pin each row was built from, or null if the row is absent
+        /// (nothing exists there in the terminal). The contents of an
+        /// absent row are undefined and must not be rendered.
+        pins: [len]?PageList.Pin = @splat(null),
+
+        /// Pending style runs for the extra rows, consumed by `endUpdate`.
+        /// This is separate from the main list so that the `y` values of
+        /// the two can't collide.
+        pending_styles: std.ArrayList(StyleRun) = .empty,
+
+        pub const above_index = 0;
+        pub const below_index = 1;
+        pub const len = 2;
+
+        pub const empty: ExtraRows = .{};
+
+        pub fn deinit(self: *ExtraRows, alloc: Allocator) void {
+            for (
+                self.row_data.items(.arena),
+                self.row_data.items(.cells),
+            ) |state, *cells| {
+                var arena: ArenaAllocator = state.promote(alloc);
+                arena.deinit();
+                cells.deinit(alloc);
+            }
+            self.row_data.deinit(alloc);
+            self.pending_styles.deinit(alloc);
+        }
+
+        /// Returns true if the row at the given index exists and has been
+        /// populated with cell data.
+        pub fn present(self: *const ExtraRows, i: usize) bool {
+            return self.pins[i] != null and i < self.row_data.len;
+        }
+
+        /// Mark both rows absent. Retains any allocated capacity.
+        fn clear(self: *ExtraRows) void {
+            self.pins = @splat(null);
+        }
     };
 
     /// The color state for the terminal.
@@ -353,6 +423,7 @@ pub const RenderState = struct {
         }
         self.row_data.deinit(alloc);
         self.pending_styles.deinit(alloc);
+        self.extra_rows.deinit(alloc);
     }
 
     /// Update the render state to the latest terminal state.
@@ -741,6 +812,14 @@ pub const RenderState = struct {
         // so the iterator always fills the full data length.
         assert(y == data_rows);
 
+        // Build the rows just outside the viewport for pixel scrolling.
+        // This is off by default; see `ExtraRows`.
+        if (self.pixel_scroll) {
+            try self.updateExtraRows(alloc, s, viewport_pin, redraw);
+        } else {
+            self.extra_rows.clear();
+        }
+
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely
         // a selection exists and because the way our selections are structured
@@ -839,6 +918,135 @@ pub const RenderState = struct {
         s.dirty = .{};
     }
 
+    /// Populate `extra_rows` with the rows immediately above and below
+    /// the viewport. See `ExtraRows` for why these are kept separate from
+    /// `row_data`.
+    ///
+    /// These rows are always rebuilt from scratch rather than using the
+    /// per-row dirty tracking of the main loop. They can't participate in
+    /// it: a row that is one past the viewport edge is invisible to a
+    /// renderer that doesn't pixel scroll, so its dirty flag may have been
+    /// consumed and cleared by an earlier update while it was still inside
+    /// the viewport. Two rows is a trivial cost next to the viewport.
+    fn updateExtraRows(
+        self: *RenderState,
+        alloc: Allocator,
+        s: *Screen,
+        viewport_pin: PageList.Pin,
+        redraw: bool,
+    ) Allocator.Error!void {
+        const extra: *ExtraRows = &self.extra_rows;
+
+        // The row above the viewport: one row back from the top-left of
+        // the viewport, crossing into the previous page if we're at the
+        // top of this one. Absent if we're at the top of the scrollback.
+        const above: ?PageList.Pin = above: {
+            if (viewport_pin.y > 0) {
+                var p = viewport_pin;
+                p.y -= 1;
+                break :above p;
+            }
+            const prev = viewport_pin.node.prev orelse break :above null;
+            break :above .{ .node = prev, .y = prev.rows() - 1 };
+        };
+
+        // The row below the viewport: one row past the bottom-right of
+        // the viewport. Absent if the viewport is at the bottom of the
+        // screen (the common case, since the viewport is usually pinned
+        // to the active area).
+        const below: ?PageList.Pin = below: {
+            const br = s.pages.getBottomRight(.viewport) orelse break :below null;
+            if (br.y + 1 < br.node.rows()) {
+                var p = br;
+                p.y += 1;
+                p.x = 0;
+                break :below p;
+            }
+            const next = br.node.next orelse break :below null;
+            break :below .{ .node = next, .y = 0 };
+        };
+
+        // If nothing changed since the last update we can keep what we
+        // have. The main loop already forces `redraw` for any terminal,
+        // screen, or page dirty state, so an unchanged viewport pin plus
+        // no redraw means these rows can't have changed either.
+        if (!redraw and
+            extra.row_data.len == ExtraRows.len and
+            pinEqlOpt(extra.pins[ExtraRows.above_index], above) and
+            pinEqlOpt(extra.pins[ExtraRows.below_index], below))
+        {
+            return;
+        }
+
+        // Grow to our fixed length on first use. We never shrink; two
+        // rows of retained capacity is not worth tracking.
+        if (extra.row_data.len < ExtraRows.len) {
+            const old_len = extra.row_data.len;
+            try extra.row_data.resize(alloc, ExtraRows.len);
+            var row_data = extra.row_data.slice();
+            for (old_len..ExtraRows.len) |i| {
+                row_data.set(i, .{
+                    .arena = .{},
+                    .pin = undefined,
+                    .raw = undefined,
+                    .cells = .empty,
+                    .dirty = true,
+                    .selection = null,
+                    .highlights = .empty,
+                });
+            }
+        }
+
+        // Our style runs are always fully regenerated below, so any
+        // pending runs from a prior update are stale.
+        extra.pending_styles.clearRetainingCapacity();
+
+        const row_data = extra.row_data.slice();
+        const builder: RowBuilder = .{
+            .alloc = alloc,
+            .cols = self.cols,
+            .arenas = row_data.items(.arena),
+            .raws = row_data.items(.raw),
+            .cells = row_data.items(.cells),
+            .sels = row_data.items(.selection),
+            .highlights = row_data.items(.highlights),
+            .dirties = row_data.items(.dirty),
+            .pending_styles = &extra.pending_styles,
+        };
+        const row_pins = row_data.items(.pin);
+
+        extra.pins = .{ above, below };
+        for (extra.pins, 0..) |pin_, i| {
+            const pin = pin_ orelse continue;
+            const p: *page.Page = pin.node.page();
+
+            // A page can have fewer columns than the viewport mid-resize.
+            // We can't build a row we can't fill, so treat it as absent
+            // rather than reading out of bounds.
+            if (p.size.cols != self.cols) {
+                extra.pins[i] = null;
+                continue;
+            }
+
+            row_pins[i] = pin;
+            const rac = pin.rowAndCell();
+
+            // Note we do NOT clear the page row's dirty flag here. It
+            // belongs to the main viewport loop; clearing it would hide a
+            // real change from the next update that includes this row.
+            try builder.row(p, rac.row, i);
+        }
+    }
+
+    /// Compare two optional pins for equality, treating null as its own
+    /// value. Pins carry an `x` we don't set consistently for rows, so we
+    /// only compare the node and y.
+    fn pinEqlOpt(a: ?PageList.Pin, b: ?PageList.Pin) bool {
+        const av = a orelse return b == null;
+        const bv = b orelse return false;
+        return av.node == bv.node and av.y == bv.y;
+    }
+
     /// Complete a prior `beginUpdate` call by performing any deferred
     /// work. At the time of writing, this denormalizes the pending
     /// style runs into the per-cell style data.
@@ -847,6 +1055,21 @@ pub const RenderState = struct {
     /// it is safe to call while the terminal is being modified (no
     /// terminal lock is required).
     pub fn endUpdate(self: *RenderState) void {
+        // The extra rows have their own run list over their own row
+        // indices, so they're applied with the same logic against their
+        // own cells.
+        if (self.extra_rows.pending_styles.items.len > 0) {
+            const extra_cells = self.extra_rows.row_data.items(.cells);
+            for (self.extra_rows.pending_styles.items) |run| {
+                if (run.y >= extra_cells.len) continue;
+                const styles = extra_cells[run.y].slice().items(.style);
+                const end = @min(run.end, styles.len);
+                const start = @min(run.start, end);
+                @memset(styles[start..end], run.style);
+            }
+            self.extra_rows.pending_styles.clearRetainingCapacity();
+        }
+
         // Common case: no styled rows were rebuilt.
         if (self.pending_styles.items.len == 0) return;
 
