@@ -20,6 +20,10 @@ struct Uniforms {
   ushort2 cursor_pos;
   uchar4 cursor_color;
   uchar4 bg_color;
+  // Vertical shift for pixel scrolling. Zero means inactive; non-zero
+  // means grid_size.y includes one extra row at each end and everything
+  // is shifted up by this many pixels. See the Zig Uniforms struct.
+  float pixel_scroll_offset_y;
   bool cursor_wide;
   bool use_display_p3;
   bool use_linear_blending;
@@ -453,7 +457,35 @@ fragment float4 cell_bg_fragment(
   constant Uniforms& uniforms [[buffer(1)]],
   constant uchar4 *cells [[buffer(2)]]
 ) {
-  int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx) / uniforms.cell_size));
+  // When pixel scrolling is active the cell buffer has one extra row at
+  // each end and the whole grid is drawn shifted up by
+  // pixel_scroll_offset_y, so a fragment samples from a row further down
+  // the buffer than its unshifted screen position indicates. At rest the
+  // offset is exactly one cell height, which puts buffer row 1 at the top
+  // of the visible area and hides both extra rows just off screen.
+  const bool has_extra_rows = uniforms.pixel_scroll_offset_y > 0.0;
+
+  // Which rows of the buffer hold viewport content. With extra rows the
+  // ends of the buffer are the rows just outside the viewport; they're
+  // real content and are meant to be seen inside the terminal area, but
+  // they must never be what the padding extends from.
+  const int first_row = has_extra_rows ? 1 : 0;
+  const int last_row = int(uniforms.grid_size.y) - 1 - (has_extra_rows ? 1 : 0);
+
+  // The row this fragment samples from, in buffer coordinates.
+  float2 scrolled_pos = in.position.xy;
+  scrolled_pos.y += uniforms.pixel_scroll_offset_y;
+  int2 grid_pos = int2(floor((scrolled_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+
+  // Whether the fragment is in the vertical padding. This is a question
+  // about where the fragment is on screen, not about what it samples, so
+  // it uses the unshifted position against the visible row count.
+  const int visible_rows = last_row - first_row + 1;
+  const int unshifted_row = int(floor(
+    (in.position.y - uniforms.grid_padding.x) / uniforms.cell_size.y
+  ));
+  const bool above_grid = unshifted_row < 0;
+  const bool below_grid = unshifted_row >= visible_rows;
 
   float4 bg = float4(0.0);
 
@@ -472,19 +504,26 @@ fragment float4 cell_bg_fragment(
     }
   }
 
-  // Clamp y position if we should extend, otherwise discard if out of bounds.
-  if (grid_pos.y < 0) {
+  // Clamp y position if we should extend, otherwise discard if out of
+  // bounds. Padding is decided by where the fragment is on screen and
+  // always extends from a viewport row, never from an extra row.
+  if (above_grid) {
     if (uniforms.padding_extend & EXTEND_UP) {
-      grid_pos.y = 0;
+      grid_pos.y = first_row;
     } else {
       return bg;
     }
-  } else if (grid_pos.y > uniforms.grid_size.y - 1) {
+  } else if (below_grid) {
     if (uniforms.padding_extend & EXTEND_DOWN) {
-      grid_pos.y = uniforms.grid_size.y - 1;
+      grid_pos.y = last_row;
     } else {
       return bg;
     }
+  } else {
+    // Inside the terminal area. The shift can push the sampled row one
+    // past either end of the buffer at the extremes of the offset range;
+    // clamp so we never read out of bounds.
+    grid_pos.y = clamp(grid_pos.y, 0, int(uniforms.grid_size.y) - 1);
   }
 
   // Load the color for the cell.
@@ -617,6 +656,14 @@ vertex CellTextVertexOut cell_text_vertex(
   // Calculate the final position of the cell which uses our glyph size
   // and glyph offset to create the correct bounding box for the glyph.
   cell_pos = cell_pos + size * corner + offset;
+
+  // Apply the pixel scroll shift, moving the whole grid up. Snap to whole
+  // pixels afterwards: the offset is already integral, but the glyph
+  // origin may not be, and a fractional Y would resample the glyph
+  // differently from frame to frame and make scrolling text shimmer.
+  cell_pos.y -= uniforms.pixel_scroll_offset_y;
+  cell_pos.y = round(cell_pos.y);
+
   out.position =
       uniforms.projection_matrix * float4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
 
@@ -681,6 +728,20 @@ fragment float4 cell_text_fragment(
   texture2d<float> textureColor [[texture(1)]],
   constant Uniforms& uniforms [[buffer(1)]]
 ) {
+  // With pixel scrolling the cell buffer has one extra row at each end,
+  // and the shift moves part of each into the terminal area. Glyphs from
+  // those rows can stick out past the top or bottom edge of the grid,
+  // where there is no cell for them to belong to. Clip them so they don't
+  // draw over the window padding.
+  if (uniforms.pixel_scroll_offset_y > 0.0) {
+    const float grid_top = uniforms.grid_padding.x;
+    const float grid_bottom =
+      grid_top + float(int(uniforms.grid_size.y) - 2) * uniforms.cell_size.y;
+    if (in.position.y < grid_top || in.position.y >= grid_bottom) {
+      discard_fragment();
+    }
+  }
+
   constexpr sampler textureSampler(
     coord::pixel,
     address::clamp_to_edge,
@@ -822,6 +883,10 @@ vertex ImageVertexOut image_vertex(
   // adds the source rect width/height components.
   float2 image_pos = (uniforms.cell_size * in.grid_pos) + in.cell_offset;
   image_pos += in.dest_size * corner;
+
+  // Images are placed in grid coordinates, so they move with the grid
+  // under pixel scrolling.
+  image_pos.y -= uniforms.pixel_scroll_offset_y;
 
   out.position =
       uniforms.projection_matrix * float4(image_pos.x, image_pos.y, 0.0f, 1.0f);

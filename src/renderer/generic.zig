@@ -161,6 +161,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scrollbar: terminal.Scrollbar,
         scrollbar_dirty: bool,
 
+        /// The sub-row pixel scroll offset most recently read out of the
+        /// shared state, in the range `[0, cell_height)`. See
+        /// `renderer.State.Mouse.pixel_scroll_offset_y`. This is zero
+        /// whenever pixel scrolling isn't currently in effect.
+        pixel_scroll_offset: f32 = 0,
+
         /// Tracks the last bottom-right pin of the screen to detect new output.
         /// When the final line changes (node or y differs), new content was added.
         /// Used for scroll-to-bottom on output feature.
@@ -677,6 +683,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background_blur: configpkg.Config.BackgroundBlur,
             macos_background_from_layer: bool,
             scroll_to_bottom_on_output: bool,
+            pixel_scroll: bool,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -752,6 +759,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_blur = config.@"background-blur",
                     .macos_background_from_layer = config.@"macos-background-from-layer",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
+                    .pixel_scroll = config.@"pixel-scroll",
                     .arena = arena,
                 };
             }
@@ -835,6 +843,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .grid_padding = undefined,
                     .screen_size = undefined,
                     .padding_extend = .{},
+                    .pixel_scroll_offset_y = 0,
                     .min_contrast = options.config.min_contrast,
                     .cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) },
                     .cursor_color = undefined,
@@ -1333,6 +1342,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
+                // Pixel scrolling shifts the grid by a sub-row amount,
+                // which needs the rows just outside the viewport to fill
+                // the bands it opens up. Ask for them while the feature
+                // is enabled, so a config reload takes effect on the next
+                // frame either way.
+                self.terminal_state.pixel_scroll = self.config.pixel_scroll;
+
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
                 // denormalization) is deferred to the endUpdate call
@@ -1342,6 +1358,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.alloc,
                     state.terminal,
                 );
+
+                // Read the pixel scroll offset produced by the surface.
+                // This is only meaningful with the extra rows to draw
+                // into, and only on the primary screen: on the alternate
+                // screen the viewport can't move, so the surface never
+                // sets it, but a stale value from before a screen switch
+                // would leave the alt screen misaligned.
+                self.pixel_scroll_offset = if (self.config.pixel_scroll and
+                    state.terminal.screens.active_key == .primary)
+                    state.mouse.pixel_scroll_offset_y
+                else
+                    0;
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -2231,11 +2259,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const terminal_size = self.size.terminal();
 
             // Blank space around the grid.
+            // Note we use the VISIBLE row count: with pixel scrolling the
+            // cell buffer carries two extra rows that are drawn outside
+            // the terminal area, and counting them would misreport how
+            // much blank space is left over.
             const blank: renderer.Padding = self.size.screen.blankPadding(
                 self.size.padding,
                 .{
                     .columns = self.cells.size.columns,
-                    .rows = self.cells.size.rows,
+                    .rows = self.cells.size.rows -| self.pixelScrollExtraRowCount(),
                 },
                 .{
                     .width = self.grid_metrics.cell_width,
@@ -2439,9 +2471,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
                 // Top edge, relative to the top of the
                 // screen, of the cell the cursor is in.
-                var pixel_y: f32 = @floatFromInt(
-                    cursor.grid_pos[1] * cell.height + padding.top,
-                );
+                //
+                // The stored grid_pos is in cell-buffer rows, which under
+                // pixel scrolling are shifted relative to the screen.
+                // Undo that here so custom shaders see where the cursor
+                // actually appears.
+                var pixel_y: f32 =
+                    @as(f32, @floatFromInt(cursor.grid_pos[1] * cell.height + padding.top)) -
+                    self.uniforms.pixel_scroll_offset_y;
 
                 // If +Y is up in our shaders, we need to flip the coordinate
                 // so that it's instead the top edge of the cell relative to
@@ -2596,6 +2633,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// This requires the draw mutex.
         ///
         /// Dirty state on terminal state won't be reset by this.
+        /// Whether the cell buffer currently carries the two extra rows
+        /// used by pixel scrolling.
+        ///
+        /// We keep the extra rows allocated for as long as the feature is
+        /// enabled, even at rest with a zero offset, so that beginning a
+        /// scroll doesn't force a resize (and therefore a full rebuild) of
+        /// the cell buffer on the very first frame of the gesture.
+        fn pixelScrollRows(self: *const Self) bool {
+            return self.config.pixel_scroll;
+        }
+
+        /// How many rows of the cell buffer are extra rows rather than
+        /// visible viewport rows.
+        fn pixelScrollExtraRowCount(self: *const Self) terminal.size.CellCountInt {
+            return if (self.pixelScrollRows()) 2 else 0;
+        }
+
+        /// Compute the shader's vertical grid shift from the current
+        /// sub-row scroll offset.
+        ///
+        /// The shader shifts the grid UP by this many pixels. With the two
+        /// extra rows in play, a shift of exactly one cell height is the
+        /// resting position: it hides the extra row above the viewport off
+        /// the top of the screen and puts viewport row 0 at the top of the
+        /// visible area. Scrolling varies the shift around that, exposing
+        /// part of one extra row or the other.
+        ///
+        /// The result is clamped to `[1, 2 * cell_height]`. It must stay
+        /// above zero because the shaders use "offset > 0" to mean the
+        /// extra rows are present; a shift of zero would make them treat
+        /// the buffer as having no extra rows at all.
+        fn pixelScrollUniform(self: *const Self) f32 {
+            if (!self.pixelScrollRows()) return 0;
+
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            const offset = std.math.clamp(self.pixel_scroll_offset, -cell_h, cell_h);
+            return @max(@round(cell_h - offset), 1.0);
+        }
+
         fn rebuildCells(
             self: *Self,
             preedit: ?renderer.State.Preedit,
@@ -2612,13 +2688,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
             // }
 
+            // With pixel scrolling we allocate two extra rows: one above
+            // the viewport and one below. Viewport row y lives at buffer
+            // row y + `row_offset`, and the shader shifts everything back
+            // up so the viewport lands where it belongs. See
+            // `terminal.RenderState.ExtraRows`.
+            const extra_rows = self.pixelScrollRows();
+            const row_offset: terminal.size.CellCountInt = if (extra_rows) 1 else 0;
+            const buffer_rows: terminal.size.CellCountInt =
+                state.rows + self.pixelScrollExtraRowCount();
+
             const grid_size_diff =
-                self.cells.size.rows != state.rows or
+                self.cells.size.rows != buffer_rows or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.rows;
+                new_size.rows = buffer_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
@@ -2647,6 +2733,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         };
                     },
                 }
+
+                // With the extra rows in play the vertical padding bands
+                // overlap them, so the bg shader has to be told to sample
+                // the nearest viewport row rather than leaving the band
+                // empty (which would show the extra row's content bleeding
+                // into the padding as a flickering sliver while scrolling).
+                if (extra_rows) {
+                    self.uniforms.padding_extend.up = true;
+                    self.uniforms.padding_extend.down = true;
+                }
             }
 
             // From this point on we never fail. We produce some kind of
@@ -2667,7 +2763,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // the top of the viewport with the top of the contents buffer.
             const row_len: usize = @min(
                 state.rows,
-                self.cells.size.rows,
+                self.cells.size.rows -| row_offset,
             );
 
             // Determine our x/y range for preedit. We don't want to render anything
@@ -2703,7 +2799,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 row_selection[0..row_len],
                 row_highlights[0..row_len],
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
-                const y: terminal.size.CellCountInt = @intCast(y_usize);
+                // The viewport row index, and the buffer row it is
+                // written to. These differ by the extra row at the top
+                // when pixel scrolling is active.
+                const vy: terminal.size.CellCountInt = @intCast(y_usize);
+                const y: terminal.size.CellCountInt = vy + row_offset;
 
                 if (!rebuild) {
                     // Only rebuild if we are doing a full rebuild or this row is dirty.
@@ -2718,6 +2818,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 self.rebuildRow(
                     y,
+                    vy,
                     row,
                     cells,
                     preedit_range,
@@ -2732,6 +2833,49 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error building row y={} err={}", .{ y, err });
                     self.cells.clear(y);
                 };
+            }
+
+            // Build the rows just outside the viewport. These fill the
+            // bands that the pixel scroll shift opens up at the top and
+            // bottom. A row that doesn't exist (we're at the top of the
+            // scrollback or the bottom of the screen) stays cleared, which
+            // renders as plain background.
+            if (extra_rows) extra: {
+                const extra = &state.extra_rows;
+                const buffer_y = [_]terminal.size.CellCountInt{
+                    0,
+                    self.cells.size.rows - 1,
+                };
+
+                // These rows sit outside the viewport so they have no
+                // viewport row index. Point their shaping cursor check at
+                // a row that can never match.
+                const no_vy = std.math.maxInt(terminal.size.CellCountInt);
+
+                if (self.cells.size.rows < 2) break :extra;
+
+                const extra_data = extra.row_data.slice();
+                for (buffer_y, 0..) |y, i| {
+                    // Always clear: unlike viewport rows these have no
+                    // dirty tracking of their own, so a stale row would
+                    // otherwise persist after the content moves on.
+                    self.cells.clear(y);
+                    if (!extra.present(i)) continue;
+
+                    self.rebuildRow(
+                        y,
+                        no_vy,
+                        extra_data.items(.raw)[i],
+                        &extra_data.items(.cells)[i],
+                        null,
+                        extra_data.items(.selection)[i],
+                        &extra_data.items(.highlights)[i],
+                        links,
+                    ) catch |err| {
+                        log.warn("error building extra row y={} err={}", .{ y, err });
+                        self.cells.clear(y);
+                    };
+                }
             }
 
             // Setup our cursor rendering information.
@@ -2806,6 +2950,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &state.cursor,
                     style,
                     cursor_color,
+                    row_offset,
                 );
 
                 // If the cursor is visible then we set our uniforms.
@@ -2820,7 +2965,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        @intCast(cursor_vp.y),
+                        // The shader compares this against a grid_pos, so
+                        // it must be in buffer rows like everything else.
+                        @intCast(cursor_vp.y + row_offset),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
@@ -2876,7 +3023,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 for (preedit_v.codepoints[range.cp_offset..]) |cp| {
                     self.addPreeditCell(
                         cp,
-                        .{ .x = x, .y = range.y },
+                        .{ .x = x, .y = range.y + row_offset },
                         state.colors.foreground,
                     ) catch |err| {
                         log.warn("error building preedit cell, will be invalid x={} y={}, err={}", .{
@@ -2890,6 +3037,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
+            // Publish the grid shift for this frame.
+            self.uniforms.pixel_scroll_offset_y = self.pixelScrollUniform();
+
             // Update that our cells rebuilt
             self.cells_rebuilt = true;
 
@@ -2899,9 +3049,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // });
         }
 
+        /// Rebuild one row of the GPU cell buffer.
+        ///
+        /// `y` is the row in the cell buffer to write to. `vy` is the same
+        /// row's position in the viewport, which is what viewport-relative
+        /// state (the cursor, the preedit range) is expressed in. The two
+        /// differ by the extra top row when pixel scrolling is active, and
+        /// for the extra rows themselves `vy` is deliberately out of range
+        /// because they aren't in the viewport at all.
         fn rebuildRow(
             self: *Self,
             y: terminal.size.CellCountInt,
+            vy: terminal.size.CellCountInt,
             row: terminal.page.Row,
             cells: *std.MultiArrayList(terminal.RenderState.Cell),
             preedit_range: ?PreeditRange,
@@ -2927,8 +3086,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // These already have the correct values set above.
                 .background, .@"extend-always" => {},
 
-                // Apply heuristics for padding extension.
-                .extend => if (y == 0) {
+                // Apply heuristics for padding extension. Note these key
+                // on the viewport row: the padding sits against the top
+                // and bottom of the VIEWPORT, so the extra rows outside
+                // it (whose vy is out of range) must not get a say.
+                //
+                // Pixel scrolling needs vertical extension unconditionally
+                // (see rebuildCells), so the heuristic only applies to the
+                // horizontal edges there.
+                .extend => if (self.pixelScrollRows()) {} else if (vy == 0) {
                     self.uniforms.padding_extend.up = !rowNeverExtendBg(
                         row,
                         cells_raw,
@@ -2936,7 +3102,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         &state.colors.palette,
                         state.colors.background,
                     );
-                } else if (y == self.cells.size.rows - 1) {
+                } else if (vy == state.rows - 1) {
                     self.uniforms.padding_extend.down = !rowNeverExtendBg(
                         row,
                         cells_raw,
@@ -2957,7 +3123,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // visible on this viewport.
                 .cursor_x = cursor_x: {
                     const vp = state.cursor.viewport orelse break :cursor_x null;
-                    if (vp.y != y) break :cursor_x null;
+                    if (vp.y != vy) break :cursor_x null;
                     break :cursor_x vp.x;
                 },
             };
@@ -2976,7 +3142,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // skip this because preedits are setup separately.
                 if (preedit_range) |range| preedit: {
                     // We're not on the preedit line, no actions necessary.
-                    if (range.y != y) break :preedit;
+                    if (range.y != vy) break :preedit;
                     // We're before the preedit range, no actions necessary.
                     if (x < range.x[0]) break :preedit;
                     // We're in the preedit range, skip this cell.
@@ -3227,7 +3393,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const underline: terminal.Attribute.Underline = underline: {
                     if (links.contains(.{
                         .x = @intCast(x),
-                        .y = @intCast(y),
+                        .y = @intCast(vy),
                     })) {
                         break :underline if (style.flags.underline == .single)
                             .double
@@ -3520,6 +3686,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cursor_state: *const terminal.RenderState.Cursor,
             cursor_style: renderer.CursorStyle,
             cursor_color: terminal.color.RGB,
+            row_offset: terminal.size.CellCountInt,
         ) void {
             const cursor_vp = cursor_state.viewport orelse return;
 
@@ -3593,7 +3760,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                .grid_pos = .{ x, cursor_vp.y + row_offset },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },

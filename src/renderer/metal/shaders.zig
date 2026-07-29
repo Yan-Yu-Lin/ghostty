@@ -227,6 +227,18 @@ pub const Uniforms = extern struct {
     /// The background color for the whole surface.
     bg_color: [4]u8 align(4),
 
+    /// The vertical pixel offset to shift the grid by, for pixel
+    /// scrolling. See `Renderer.pixel_scroll_offset`.
+    ///
+    /// Zero means pixel scrolling is inactive and the grid is drawn
+    /// exactly as sized. A non-zero value means the grid has one extra
+    /// row at each end (`grid_size.y` is two larger than the visible
+    /// row count) and everything is shifted up by this many pixels. At
+    /// rest that value is exactly one cell height, which puts the first
+    /// extra row just off the top of the screen; it ranges over
+    /// `(0, 2 * cell_height]` while scrolling.
+    pixel_scroll_offset_y: f32 align(4),
+
     /// Various booleans.
     ///
     /// TODO: Maybe put these in a packed struct, like for OpenGL.
@@ -451,4 +463,28 @@ fn checkError(err_: ?*anyopaque) !void {
 
     log.err("metal error={s}", .{str.cstringPtr(.ascii).?});
     return error.MetalFailed;
+}
+
+// The Uniforms struct is shared with the MSL definition in
+// src/renderer/shaders/shaders.metal by raw memory layout, and nothing in
+// the build checks that the two agree. A mismatch doesn't fail to compile;
+// it silently feeds every shader garbage. These offsets were taken from
+// the Metal compiler for the matching MSL struct, so a change to either
+// side that doesn't have a matching change to the other fails here.
+test "Uniforms layout matches the MSL definition" {
+    const testing = std.testing;
+
+    try testing.expectEqual(144, @sizeOf(Uniforms));
+    try testing.expectEqual(0, @offsetOf(Uniforms, "projection_matrix"));
+    try testing.expectEqual(64, @offsetOf(Uniforms, "screen_size"));
+    try testing.expectEqual(72, @offsetOf(Uniforms, "cell_size"));
+    try testing.expectEqual(80, @offsetOf(Uniforms, "grid_size"));
+    try testing.expectEqual(96, @offsetOf(Uniforms, "grid_padding"));
+    try testing.expectEqual(112, @offsetOf(Uniforms, "padding_extend"));
+    try testing.expectEqual(116, @offsetOf(Uniforms, "min_contrast"));
+    try testing.expectEqual(120, @offsetOf(Uniforms, "cursor_pos"));
+    try testing.expectEqual(124, @offsetOf(Uniforms, "cursor_color"));
+    try testing.expectEqual(128, @offsetOf(Uniforms, "bg_color"));
+    try testing.expectEqual(132, @offsetOf(Uniforms, "pixel_scroll_offset_y"));
+    try testing.expectEqual(136, @offsetOf(Uniforms, "bools"));
 }
