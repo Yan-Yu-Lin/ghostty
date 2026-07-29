@@ -360,6 +360,17 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
+    /// The sub-line pixel remainder for pixel scrolling (`pixel-scroll`).
+    /// This is only used on the primary screen when scrollback exists.
+    ///
+    /// Range is `(-cell_height, 0]`: zero means the viewport is exactly
+    /// aligned to a row boundary, and a negative value means the content
+    /// should be drawn that many pixels higher than the row grid, i.e. we
+    /// are partway between the current viewport row and the one below it.
+    /// The renderer receives the negated (positive) value; see
+    /// `renderer.State.Mouse.pixel_scroll_offset_y`.
+    pixel_scroll_offset: f64 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -528,6 +539,7 @@ const DerivedConfig = struct {
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     mouse_shift_capture: configpkg.MouseShiftCapture,
+    pixel_scroll: bool,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
     macos_option_as_alt: ?input.OptionAsAlt,
@@ -613,6 +625,7 @@ const DerivedConfig = struct {
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
             .mouse_shift_capture = config.@"mouse-shift-capture",
+            .pixel_scroll = config.@"pixel-scroll",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",

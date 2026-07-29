@@ -113,6 +113,19 @@ pub const Mouse = struct {
     /// This could really just be mods in general and we probably will
     /// move it out of mouse state at some point.
     mods: inputpkg.Mods = .{},
+
+    /// The sub-line pixel scroll offset in the range `[0, cell_height)`.
+    ///
+    /// This is how many pixels the user has scrolled up beyond the current
+    /// viewport row: the viewport itself only moves in whole rows, so the
+    /// renderer draws the grid this many pixels LOWER than its row-aligned
+    /// position and fills the resulting band at the top with the row above
+    /// the viewport. Zero means the viewport is row-aligned, which is
+    /// always the case when `pixel-scroll` is off, on the alternate
+    /// screen, or when there is no scrollback.
+    ///
+    /// See `Surface.Mouse.pixel_scroll_offset` for the producer side.
+    pixel_scroll_offset_y: f32 = 0,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.
