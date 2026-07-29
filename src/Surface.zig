@@ -4032,6 +4032,14 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
     self.size.cell = size;
     self.balancePaddingIfNeeded();
 
+    // Any pending pixel scroll remainder was measured against the old
+    // cell height, so it's the wrong number of pixels now.
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        self.resetPixelScroll();
+    }
+
     // Notify the terminal
     self.queueIo(.{ .resize = self.size }, .unlocked);
 
@@ -4580,7 +4588,10 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) {
+            self.io.terminal.scrollViewport(.bottom);
+            self.resetPixelScroll();
+        }
 
         try self.queueRender();
     }
@@ -5181,6 +5192,42 @@ const ScrollAmount = struct {
 /// "Natural scrolling" is a macOS term for inverting the scroll direction.
 /// This should be handled by the apprt implementation. At this layer,
 /// negative is always down, left.
+///
+/// Convert a raw vertical scroll offset into pixels.
+///
+/// If we have precision scroll, yoff is already the number of pixels to
+/// scroll. In non-precision scroll, yoff is the number of wheel ticks. Some
+/// mice are capable of reporting fractional wheel ticks, which don't
+/// necessarily get reported as precision scrolls. We normalize all scroll
+/// events to pixels by multiplying the wheel tick value and the cell size.
+/// This means that a wheel tick of 1 results in a single scroll event.
+fn scrollPixelDelta(
+    yoff: f64,
+    scroll_mods: input.ScrollMods,
+    cell_height: f64,
+    multiplier: configpkg.MouseScrollMultiplier,
+) f64 {
+    if (scroll_mods.precision) return yoff * multiplier.precision;
+
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        // Round out the yoff to an absolute minimum of 1. macos tries to
+        // simulate precision scrolling with non precision events by
+        // ramping up the magnitude of the offsets as it detects faster
+        // scrolling. Single click (very slow) scrolls are reported with a
+        // magnitude of 0.1 which would normally require a few clicks
+        // before we register an actual scroll event (depending on cell
+        // height and the mouse_scroll_multiplier setting).
+        const yoff_max: f64 = if (yoff > 0)
+            @max(yoff, 1)
+        else
+            @min(yoff, -1);
+
+        return yoff_max * cell_height * multiplier.discrete;
+    }
+
+    return yoff * cell_height * multiplier.discrete;
+}
+
 pub fn scrollCallback(
     self: *Surface,
     xoff: f64,
@@ -5196,36 +5243,22 @@ pub fn scrollCallback(
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
 
+    // The pixel scroll path consumes the raw yoff itself rather than the
+    // line-quantized `y` below, so it needs the adjusted pixel delta. We
+    // compute it here (identically to the `y` block) so both paths agree
+    // on how a wheel tick maps to pixels.
+    const pixel_yoff: f64 = if (yoff == 0) 0 else scrollPixelDelta(
+        yoff,
+        scroll_mods,
+        @floatFromInt(self.size.cell.height),
+        self.config.mouse_scroll_multiplier,
+    );
+
     const y: ScrollAmount = if (yoff == 0) .{} else y: {
         // We use cell_size to determine if we have accumulated enough to trigger a scroll
         const cell_size: f64 = @floatFromInt(self.size.cell.height);
 
-        // If we have precision scroll, yoff is the number of pixels to scroll. In non-precision
-        // scroll, yoff is the number of wheel ticks. Some mice are capable of reporting fractional
-        // wheel ticks, which don't necessarily get reported as precision scrolls. We normalize all
-        // scroll events to pixels by multiplying the wheel tick value and the cell size. This means
-        // that a wheel tick of 1 results in single scroll event.
-        const yoff_adjusted: f64 = if (scroll_mods.precision)
-            yoff * self.config.mouse_scroll_multiplier.precision
-        else yoff_adjusted: {
-            if (comptime builtin.target.os.tag.isDarwin()) {
-                // Round out the yoff to an absolute minimum of 1. macos tries to
-                // simulate precision scrolling with non precision events by
-                // ramping up the magnitude of the offsets as it detects faster
-                // scrolling. Single click (very slow) scrolls are reported with a
-                // magnitude of 0.1 which would normally require a few clicks
-                // before we register an actual scroll event (depending on cell
-                // height and the mouse_scroll_multiplier setting).
-                const yoff_max: f64 = if (yoff > 0)
-                    @max(yoff, 1)
-                else
-                    @min(yoff, -1);
-
-                break :yoff_adjusted yoff_max * cell_size * self.config.mouse_scroll_multiplier.discrete;
-            } else {
-                break :yoff_adjusted yoff * cell_size * self.config.mouse_scroll_multiplier.discrete;
-            }
-        };
+        const yoff_adjusted: f64 = pixel_yoff;
 
         // Add our previously saved pending amount to the offset to get the
         // new offset value. The signs of the pending and yoff should match
@@ -5349,15 +5382,163 @@ pub fn scrollCallback(
             return;
         }
 
-        if (y.delta != 0) {
-            // Modify our viewport, this requires a lock since it affects
-            // rendering. We have to switch signs here because our delta
-            // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+        // Pixel scrolling: instead of only moving the viewport in whole
+        // rows and discarding the sub-row remainder, we keep the remainder
+        // and hand it to the renderer, which shifts the whole grid by that
+        // many pixels. The viewport still moves a row at a time; the
+        // remainder is what makes the motion continuous.
+        if (self.pixelScrollActive()) {
+            self.applyPixelScroll(pixel_yoff);
+        } else {
+            // Any offset we were holding is no longer meaningful.
+            self.resetPixelScroll();
+
+            if (y.delta != 0) {
+                // Modify our viewport, this requires a lock since it affects
+                // rendering. We have to switch signs here because our delta
+                // is negative down but our viewport is positive down.
+                self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            }
         }
     }
 
     try self.queueRender();
+}
+
+/// Whether the pixel scroll path should handle the next scroll event.
+///
+/// Pixel scrolling only applies to the primary screen with scrollback to
+/// move through. On the alternate screen the viewport can't move at all,
+/// and with no scrollback there is nothing above the viewport to reveal,
+/// so in both cases a sub-row offset would just shift the screen off its
+/// alignment for no benefit.
+///
+/// Precondition: the renderer_state mutex must be held.
+fn pixelScrollActive(self: *const Surface) bool {
+    if (!self.config.pixel_scroll) return false;
+    if (self.io.terminal.screens.active_key != .primary) return false;
+    const pages = &self.io.terminal.screens.active.pages;
+    return pages.total_rows > pages.rows;
+}
+
+/// Accumulate a pixel scroll delta, moving the viewport by whole rows as
+/// the accumulator crosses cell boundaries and publishing the sub-row
+/// remainder to the renderer.
+///
+/// `delta` is in pixels, positive up (matching the raw scroll offset).
+///
+/// Precondition: the renderer_state mutex must be held.
+fn applyPixelScroll(self: *Surface, delta: f64) void {
+    if (delta == 0) return;
+
+    const cell_height: f64 = @floatFromInt(self.size.cell.height);
+    if (cell_height <= 0) return;
+
+    // How many rows the viewport can still move in each direction. The
+    // scrollbar already computes (and caches) the viewport's offset from
+    // the top of the screen, which is exactly what we need.
+    const bar = self.io.terminal.screens.active.pages.scrollbar();
+    const up: usize = bar.offset;
+    const down: usize = bar.total -| bar.len -| bar.offset;
+
+    // Our accumulator is positive down to match the viewport, so scrolling
+    // up (positive delta) moves it negative.
+    const step = pixelScrollAccumulate(
+        self.mouse.pixel_scroll_offset - delta,
+        cell_height,
+        up,
+        down,
+    );
+
+    self.mouse.pixel_scroll_offset = step.remainder;
+    if (step.rows != 0) {
+        self.io.terminal.scrollViewport(.{ .delta = step.rows });
+    }
+
+    // The renderer wants how far we are BELOW the row boundary as a
+    // positive number, so negate. Our accumulator is in (-cell_height, 0].
+    self.renderer_state.mouse.pixel_scroll_offset_y =
+        @floatCast(-self.mouse.pixel_scroll_offset);
+}
+
+/// Clear any pending pixel scroll offset so the grid renders row-aligned.
+///
+/// This must be called whenever the offset would become stale: a screen
+/// switch, a jump to the top or bottom of the scrollback, or a change to
+/// the cell height (which would make the remainder the wrong size).
+///
+/// Precondition: the renderer_state mutex must be held.
+fn resetPixelScroll(self: *Surface) void {
+    self.mouse.pixel_scroll_offset = 0;
+    self.renderer_state.mouse.pixel_scroll_offset_y = 0;
+}
+
+/// The result of accumulating a pixel scroll delta: how many whole rows
+/// the viewport should move and what sub-row remainder is left over.
+const PixelScrollStep = struct {
+    /// Rows to scroll the viewport, positive down (viewport convention).
+    rows: isize,
+
+    /// The leftover offset, always in `(-cell_height, 0]`.
+    remainder: f64,
+};
+
+/// Split an accumulated pixel offset into whole rows plus a remainder.
+///
+/// `offset` is positive down. The remainder is normalized into
+/// `(-cell_height, 0]` so that the renderer always shifts the grid down
+/// by a non-negative amount and fills the gap it opens at the top with
+/// the row above the viewport. That is, we are always rendering the
+/// viewport plus "a bit of the row above it" rather than switching
+/// between two different fill directions.
+///
+/// `up` and `down` are how many rows the viewport can still move in each
+/// direction. We stop consuming the accumulator once we run out of room:
+/// the viewport can't move any further, so a leftover remainder would
+/// leave the content permanently displaced from the row grid. Snapping to
+/// zero is what makes hitting the top or bottom of the scrollback come to
+/// a clean stop.
+fn pixelScrollAccumulate(
+    offset: f64,
+    cell_height: f64,
+    up: usize,
+    down: usize,
+) PixelScrollStep {
+    assert(cell_height > 0);
+
+    // Remaining headroom, decremented as we consume rows.
+    var up_left: usize = up;
+    var down_left: usize = down;
+
+    var remainder = offset;
+    var rows: isize = 0;
+
+    // Scrolling down: each full cell we've accumulated advances the
+    // viewport one row and comes back out of the accumulator.
+    while (remainder > 0) {
+        if (down_left == 0) return .{ .rows = rows, .remainder = 0 };
+        down_left -= 1;
+        up_left += 1;
+        remainder -= cell_height;
+        rows += 1;
+    }
+
+    // Scrolling up: same, in the other direction. Note the asymmetry with
+    // the loop above is deliberate and is what keeps the remainder in
+    // `(-cell_height, 0]` rather than `[0, cell_height)`.
+    while (remainder <= -cell_height) {
+        if (up_left == 0) return .{ .rows = rows, .remainder = 0 };
+        up_left -= 1;
+        remainder += cell_height;
+        rows -= 1;
+    }
+
+    // A negative remainder means the renderer shifts the grid down and
+    // fills the exposed band with the row above the viewport. At the top
+    // of the scrollback there is no such row, so we have to sit flush.
+    if (up_left == 0) remainder = 0;
+
+    return .{ .rows = rows, .remainder = remainder };
 }
 
 /// This is called when the content scale of the surface changes. The surface
@@ -6750,6 +6931,7 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
     self.io.terminal.scrollViewport(.{ .bottom = {} });
+    self.resetPixelScroll();
     try self.queueRender();
 }
 
@@ -8002,6 +8184,7 @@ fn completeTextInput(
 
     if (self.config.scroll_to_bottom.keystroke) {
         self.io.terminal.scrollViewport(.bottom);
+        self.resetPixelScroll();
     }
 
     try self.queueRender();
@@ -9919,4 +10102,123 @@ test "Surface: oversized soft-wrapped URL candidate is rejected" {
             null,
         )) == null);
     }
+}
+
+test "Surface: pixel scroll accumulates a sub-row remainder" {
+    const testing = std.testing;
+
+    // A delta smaller than a cell moves no rows and is held entirely
+    // as the remainder. Our accumulator is positive down, so a scroll
+    // up of 6px arrives as -6.
+    const step = pixelScrollAccumulate(-6, 20, 100, 100);
+    try testing.expectEqual(@as(isize, 0), step.rows);
+    try testing.expectEqual(@as(f64, -6), step.remainder);
+}
+
+test "Surface: pixel scroll crosses a row boundary and keeps the remainder" {
+    const testing = std.testing;
+
+    // Scrolling up past one full cell advances the viewport one row up
+    // and leaves the excess behind.
+    {
+        const step = pixelScrollAccumulate(-25, 20, 100, 100);
+        try testing.expectEqual(@as(isize, -1), step.rows);
+        try testing.expectEqual(@as(f64, -5), step.remainder);
+    }
+
+    // Exactly one cell is a clean row with no remainder. Note the
+    // remainder range is (-cell_height, 0], so -20 consumes a row and
+    // lands on 0 rather than staying at -20 with 0 rows.
+    {
+        const step = pixelScrollAccumulate(-20, 20, 100, 100);
+        try testing.expectEqual(@as(isize, -1), step.rows);
+        try testing.expectEqual(@as(f64, 0), step.remainder);
+    }
+
+    // Several cells at once (a fast flick or a big wheel tick).
+    {
+        const step = pixelScrollAccumulate(-70, 20, 100, 100);
+        try testing.expectEqual(@as(isize, -3), step.rows);
+        try testing.expectEqual(@as(f64, -10), step.remainder);
+    }
+}
+
+test "Surface: pixel scroll normalizes downward motion into the remainder range" {
+    const testing = std.testing;
+
+    // Scrolling down is a positive accumulator. The remainder is always
+    // normalized into (-cell_height, 0], so a positive offset consumes
+    // a row to get back into range.
+    {
+        const step = pixelScrollAccumulate(5, 20, 100, 100);
+        try testing.expectEqual(@as(isize, 1), step.rows);
+        try testing.expectEqual(@as(f64, -15), step.remainder);
+    }
+
+    // A whole cell down is a clean row.
+    {
+        const step = pixelScrollAccumulate(20, 20, 100, 100);
+        try testing.expectEqual(@as(isize, 1), step.rows);
+        try testing.expectEqual(@as(f64, 0), step.remainder);
+    }
+}
+
+test "Surface: pixel scroll snaps at the bottom of the scrollback" {
+    const testing = std.testing;
+
+    // With no room to scroll down, a downward scroll must not leave a
+    // remainder: the viewport can't move, so any offset would displace
+    // the content permanently.
+    {
+        const step = pixelScrollAccumulate(15, 20, 100, 0);
+        try testing.expectEqual(@as(isize, 0), step.rows);
+        try testing.expectEqual(@as(f64, 0), step.remainder);
+    }
+
+    // We consume the rows that ARE available and then snap.
+    {
+        const step = pixelScrollAccumulate(50, 20, 100, 2);
+        try testing.expectEqual(@as(isize, 2), step.rows);
+        try testing.expectEqual(@as(f64, 0), step.remainder);
+    }
+}
+
+test "Surface: pixel scroll snaps at the top of the scrollback" {
+    const testing = std.testing;
+
+    // A negative remainder means the renderer fills the exposed band
+    // with the row above the viewport. At the top there is no such row,
+    // so we must sit flush even for a sub-row delta.
+    {
+        const step = pixelScrollAccumulate(-6, 20, 0, 100);
+        try testing.expectEqual(@as(isize, 0), step.rows);
+        try testing.expectEqual(@as(f64, 0), step.remainder);
+    }
+
+    // Consume the available rows, then snap rather than holding the
+    // leftover 10px.
+    {
+        const step = pixelScrollAccumulate(-50, 20, 2, 100);
+        try testing.expectEqual(@as(isize, -2), step.rows);
+        try testing.expectEqual(@as(f64, 0), step.remainder);
+    }
+
+    // Scrolling up to exactly the last available row still snaps,
+    // because there is no row above the new viewport position.
+    {
+        const step = pixelScrollAccumulate(-40, 20, 2, 100);
+        try testing.expectEqual(@as(isize, -2), step.rows);
+        try testing.expectEqual(@as(f64, 0), step.remainder);
+    }
+}
+
+test "Surface: pixel scroll headroom tracks rows already consumed" {
+    const testing = std.testing;
+
+    // Scrolling down frees up headroom above us, so a subsequent
+    // upward move within the same accumulation is allowed even if we
+    // started with none.
+    const step = pixelScrollAccumulate(25, 20, 0, 5);
+    try testing.expectEqual(@as(isize, 2), step.rows);
+    try testing.expectEqual(@as(f64, -15), step.remainder);
 }
