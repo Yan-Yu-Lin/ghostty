@@ -198,6 +198,52 @@ pub const Coordinate = union(enum) {
     }
 };
 
+/// How many pixels the renderer shifts the terminal grid UP when pixel
+/// scrolling is enabled.
+///
+/// With pixel scrolling the cell buffer carries one extra row above the
+/// viewport and one below, so viewport row `y` is written to buffer row
+/// `y + 1` and the whole grid is drawn shifted up by this many pixels.
+/// A shift of exactly one cell height is the resting position: it hides
+/// the extra row above off the top of the screen and puts viewport row 0
+/// at the top of the visible area. A non-zero sub-row `offset` (how far
+/// the user has scrolled past the current row boundary, in `[0,
+/// cell_height)`) reduces the shift, revealing that much of the row above.
+///
+/// The result is clamped to at least 1 because the shaders use
+/// "shift > 0" to mean the extra rows are present; a shift of zero would
+/// make them treat the buffer as having no extra rows at all.
+///
+/// This is deliberately shared between the renderer, which turns it into
+/// the `pixel_scroll_offset_y` uniform, and `Surface.posToViewport`,
+/// which has to invert it to hit-test the mouse against what was drawn.
+/// Both need the same rounding: a hit-test derived from the unrounded
+/// offset would disagree with the drawn position by up to half a pixel,
+/// and near `offset == cell_height` the `@max` below is a full pixel.
+///
+/// Callers must not call this at all when pixel scrolling is off, since
+/// there are no extra rows to compensate for then and the correct shift
+/// is zero rather than one cell height.
+pub fn pixelScrollShift(offset: f64, cell_height: f64) f64 {
+    const clamped = std.math.clamp(offset, -cell_height, cell_height);
+    return @max(@round(cell_height - clamped), 1.0);
+}
+
+test "pixelScrollShift at rest is exactly one cell" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(f64, 20), pixelScrollShift(0, 20));
+}
+
+test "pixelScrollShift shrinks as the offset grows" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(f64, 15), pixelScrollShift(5, 20));
+    try testing.expectEqual(@as(f64, 1), pixelScrollShift(19, 20));
+
+    // Never zero: the shaders read that as "no extra rows".
+    try testing.expectEqual(@as(f64, 1), pixelScrollShift(19.9, 20));
+    try testing.expectEqual(@as(f64, 1), pixelScrollShift(20, 20));
+}
+
 /// The dimensions of a single "cell" in the terminal grid.
 ///
 /// The dimensions are dependent on the current loaded set of font glyphs.
