@@ -244,6 +244,100 @@ test "pixelScrollShift shrinks as the offset grows" {
     try testing.expectEqual(@as(f64, 1), pixelScrollShift(20, 20));
 }
 
+/// Convert a surface-space y coordinate to a viewport row the way
+/// `Surface.posToViewport` does, for the tests below.
+fn testHitTestRow(surface_y: f64, shift: f64, size: Size) GridSize.Unit {
+    const coord: Coordinate = .{ .surface = .{
+        .x = 0,
+        .y = surface_y + (shift - @as(f64, @floatFromInt(size.cell.height))),
+    } };
+    return coord.convert(.grid, size).grid.y;
+}
+
+test "pixel scroll hit-testing agrees with the drawn position" {
+    const testing = std.testing;
+
+    // 10 rows of 20px, 7px of padding above the grid.
+    const size: Size = .{
+        .screen = .{ .width = 100, .height = 200 + 7 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{ .top = 7, .bottom = 0, .left = 0, .right = 0 },
+    };
+    const cell_h: f64 = 20;
+    const rows = size.grid().rows;
+    try testing.expectEqual(@as(GridSize.Unit, 10), rows);
+
+    // For every sub-row offset the accumulator can hold, every pixel the
+    // renderer draws a viewport row into must hit-test back to that row.
+    // The renderer draws viewport row y (buffer row y + 1) into the band
+    // starting at (y + 1) * cell_h - shift, in terminal space.
+    for (0..@intFromFloat(cell_h)) |offset_int| {
+        const offset: f64 = @floatFromInt(offset_int);
+        const shift = pixelScrollShift(offset, cell_h);
+
+        for (0..rows) |row_int| {
+            const row: GridSize.Unit = @intCast(row_int);
+            const top = @as(f64, @floatFromInt(row + 1)) * cell_h - shift +
+                @as(f64, @floatFromInt(size.padding.top));
+
+            // Sample the first and last pixel of the drawn band, but only
+            // where it is actually on screen: the top of row 0's band can
+            // sit above the grid (that is the sliver showing the row above
+            // the viewport) and the bottom of the last row's band can sit
+            // below it.
+            for ([_]f64{ top, top + cell_h - 1 }) |y| {
+                if (y < @as(f64, @floatFromInt(size.padding.top))) continue;
+                if (y >= @as(f64, @floatFromInt(size.padding.top)) +
+                    @as(f64, @floatFromInt(rows)) * cell_h) continue;
+                try testing.expectEqual(row, testHitTestRow(y, shift, size));
+            }
+        }
+    }
+}
+
+test "pixel scroll hit-testing is unchanged at rest" {
+    const testing = std.testing;
+
+    const size: Size = .{
+        .screen = .{ .width = 100, .height = 200 + 7 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{ .top = 7, .bottom = 0, .left = 0, .right = 0 },
+    };
+    const shift = pixelScrollShift(0, 20);
+
+    // A zero offset must produce exactly the uncorrected conversion,
+    // otherwise every unscrolled surface would regress.
+    var y: f64 = 0;
+    while (y < 207) : (y += 1) {
+        const expected = (Coordinate{ .surface = .{ .x = 0, .y = y } })
+            .convert(.grid, size).grid.y;
+        try testing.expectEqual(expected, testHitTestRow(y, shift, size));
+    }
+}
+
+test "pixel scroll hit-testing clamps the revealed sliver to row 0" {
+    const testing = std.testing;
+
+    const size: Size = .{
+        .screen = .{ .width = 100, .height = 200 + 7 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{ .top = 7, .bottom = 0, .left = 0, .right = 0 },
+    };
+
+    // Scrolled 8px past the row boundary, so the top 8px of the grid area
+    // shows the row ABOVE the viewport. Viewport coordinates are unsigned
+    // so there is no row to name; we clamp to 0, exactly as the padding
+    // above the grid already does.
+    const shift = pixelScrollShift(8, 20);
+    try testing.expectEqual(@as(GridSize.Unit, 0), testHitTestRow(7, shift, size));
+    try testing.expectEqual(@as(GridSize.Unit, 0), testHitTestRow(14, shift, size));
+
+    // The first pixel that genuinely belongs to viewport row 0.
+    try testing.expectEqual(@as(GridSize.Unit, 0), testHitTestRow(15, shift, size));
+    // ...and the first pixel of row 1, one cell later.
+    try testing.expectEqual(@as(GridSize.Unit, 1), testHitTestRow(35, shift, size));
+}
+
 /// The dimensions of a single "cell" in the terminal grid.
 ///
 /// The dimensions are dependent on the current loaded set of font glyphs.

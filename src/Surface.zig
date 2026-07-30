@@ -5615,7 +5615,14 @@ fn mouseReport(
         .mods = mods,
         .pos = .{
             .x = pos.x,
-            .y = pos.y,
+            // `mouse_encode` does its own pixel-to-cell conversion, so it
+            // needs the same correction `posToViewport` applies: report the
+            // cell the user is pointing at on screen, not the one that
+            // would be there if the grid were row-aligned. This is almost
+            // always a no-op, since enabling mouse reporting suppresses the
+            // pixel scroll path, but an offset left over from before it was
+            // enabled would otherwise misreport every event.
+            .y = pos.y + @as(f32, @floatCast(self.pixelScrollHitTestShift())),
         },
     }, encoding_opts) catch |err| switch (err) {
         error.WriteFailed => {
@@ -6908,9 +6915,43 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 
 pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {
     // Get our grid cell
-    const coord: rendererpkg.Coordinate = .{ .surface = .{ .x = xpos, .y = ypos } };
+    const coord: rendererpkg.Coordinate = .{ .surface = .{
+        .x = xpos,
+        .y = ypos + self.pixelScrollHitTestShift(),
+    } };
     const grid = coord.convert(.grid, self.size).grid;
     return .{ .x = grid.x, .y = grid.y };
+}
+
+/// How many pixels to add to a surface-space y coordinate before
+/// converting it to a grid row, so that the row we name is the row the
+/// renderer actually drew there.
+///
+/// With pixel scrolling the renderer draws viewport row `y` (buffer row
+/// `y + 1`) into the band starting at `(y + 1) * cell_height - shift`,
+/// where `shift` is `renderer.size.pixelScrollShift`. Inverting that
+/// gives `y = floor((ypos + shift - cell_height) / cell_height)`, i.e.
+/// the plain conversion applied to `ypos + (shift - cell_height)`.
+///
+/// At rest the offset is zero, `shift` is exactly one cell height, and
+/// this returns zero — the conversion is then bit-for-bit what it was
+/// before pixel scrolling existed. That is also the only thing that runs
+/// when `pixel-scroll` is off, on the alternate screen, or with no
+/// scrollback, since the offset is held at zero in all of those cases.
+///
+/// This deliberately reads `renderer_state` without the mutex. The offset
+/// is a single `f32` written only by the surface's own scroll handling on
+/// this same thread; a torn or stale read costs at most one frame of
+/// hover feedback, and taking the lock here would mean taking it on every
+/// mouse motion event, including the paths that call this before locking.
+fn pixelScrollHitTestShift(self: *const Surface) f64 {
+    const offset: f64 = self.renderer_state.mouse.pixel_scroll_offset_y;
+    if (offset == 0) return 0;
+
+    const cell_height: f64 = @floatFromInt(self.size.cell.height);
+    if (cell_height <= 0) return 0;
+
+    return rendererpkg.size.pixelScrollShift(offset, cell_height) - cell_height;
 }
 
 /// Scroll to the bottom of the viewport.
