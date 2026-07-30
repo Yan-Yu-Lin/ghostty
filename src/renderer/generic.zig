@@ -2864,23 +2864,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Compute the shader's vertical grid shift from the current
         /// sub-row scroll offset.
         ///
-        /// The shader shifts the grid UP by this many pixels. With the two
-        /// extra rows in play, a shift of exactly one cell height is the
-        /// resting position: it hides the extra row above the viewport off
-        /// the top of the screen and puts viewport row 0 at the top of the
-        /// visible area. Scrolling varies the shift around that, exposing
-        /// part of one extra row or the other.
-        ///
-        /// The result is clamped to `[1, 2 * cell_height]`. It must stay
-        /// above zero because the shaders use "offset > 0" to mean the
-        /// extra rows are present; a shift of zero would make them treat
-        /// the buffer as having no extra rows at all.
+        /// See `renderer.size.pixelScrollShift` for what the value means.
+        /// The formula lives there rather than here because
+        /// `Surface.posToViewport` has to invert it to hit-test the mouse
+        /// against what we draw, and the two must not drift apart.
         fn pixelScrollUniform(self: *const Self) f32 {
             if (!self.pixelScrollRows()) return 0;
 
-            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
-            const offset = std.math.clamp(self.pixel_scroll_offset, -cell_h, cell_h);
-            return @max(@round(cell_h - offset), 1.0);
+            return @floatCast(renderer.size.pixelScrollShift(
+                self.pixel_scroll_offset,
+                @floatFromInt(self.grid_metrics.cell_height),
+            ));
         }
 
         fn rebuildCells(
