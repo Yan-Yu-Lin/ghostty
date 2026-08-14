@@ -988,6 +988,7 @@ pub const RenderState = struct {
                 row_data.set(i, .{
                     .arena = .{},
                     .pin = undefined,
+                    .serial = undefined,
                     .raw = undefined,
                     .cells = .empty,
                     .dirty = true,
@@ -1014,6 +1015,7 @@ pub const RenderState = struct {
             .pending_styles = &extra.pending_styles,
         };
         const row_pins = row_data.items(.pin);
+        const row_serials = row_data.items(.serial);
 
         extra.pins = .{ above, below };
         for (extra.pins, 0..) |pin_, i| {
@@ -1029,6 +1031,7 @@ pub const RenderState = struct {
             }
 
             row_pins[i] = pin;
+            row_serials[i] = pin.node.serial;
             const rac = pin.rowAndCell();
 
             // Note we do NOT clear the page row's dirty flag here. It
@@ -3107,8 +3110,9 @@ test "top overscan combines with pixel scroll bottom overscan" {
 test "extra rows are absent by default" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback = 100,
@@ -3140,8 +3144,9 @@ test "extra rows are absent by default" {
 test "extra rows expose the rows just outside the viewport" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback = 100,
@@ -3188,8 +3193,9 @@ test "extra rows expose the rows just outside the viewport" {
 test "extra row above is absent at the top of the scrollback" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback = 100,
@@ -3219,8 +3225,9 @@ test "extra row above is absent at the top of the scrollback" {
 test "extra row below is absent at the bottom of the screen" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback = 100,
@@ -3249,8 +3256,9 @@ test "extra row below is absent at the bottom of the screen" {
 test "extra rows follow the viewport across updates" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback = 100,
