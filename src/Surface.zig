@@ -4024,8 +4024,8 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
     // Any pending pixel scroll remainder was measured against the old
     // cell height, so it's the wrong number of pixels now.
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         self.resetPixelScroll();
     }
 
