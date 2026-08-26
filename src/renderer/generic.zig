@@ -29,6 +29,16 @@ const Health = renderer.Health;
 const compat_file = @import("../lib/compat/file.zig");
 const global = @import("../global.zig");
 
+/// Monotonic cubic ease-out for discrete wheel motion. The result always
+/// retains `start`'s sign and its magnitude never increases, so recoil is
+/// impossible even when a direction change interrupts an active glide.
+fn wheelScrollEase(start: f32, elapsed_s: f32, duration_s: f32) f32 {
+    if (duration_s <= 0 or elapsed_s >= duration_s) return 0;
+    const t = std.math.clamp(elapsed_s / duration_s, 0, 1);
+    const remaining = 1 - t;
+    return start * remaining * remaining * remaining;
+}
+
 const getConstraint = @import("../font/nerd_font_attributes.zig").getConstraint;
 
 const FileType = @import("../file_type.zig").FileType;
@@ -246,6 +256,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// `renderer.State.Mouse.pixel_scroll_offset_y`. This is zero
         /// whenever pixel scrolling isn't currently in effect.
         pixel_scroll_offset: f32 = 0,
+
+        /// Visual displacement for a discrete wheel row crossing. This is
+        /// combined with the direct precision offset and eased monotonically
+        /// to zero. Units are pixels and are bounded to one cached extra row.
+        wheel_scroll_offset_y: f32 = 0,
+        wheel_scroll_start_offset_y: f32 = 0,
+        wheel_scroll_start_time: ?std.Io.Timestamp = null,
+        wheel_scroll_animating: bool = false,
 
         /// Tracks the last bottom-right pin of the screen to detect new output.
         /// When the final line changes (node or y differs), new content was added.
@@ -822,6 +840,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             macos_background_from_layer: bool,
             scroll_to_bottom_on_output: bool,
             pixel_scroll: bool,
+            scroll_animation_duration: f32,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -898,6 +917,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .macos_background_from_layer = config.@"macos-background-from-layer",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .pixel_scroll = config.@"pixel-scroll",
+                    .scroll_animation_duration = @max(0, config.@"scroll-animation-duration"),
                     .arena = arena,
                 };
             }
@@ -1301,10 +1321,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
         }
 
-        /// True if our renderer has animations so that a higher frequency
-        /// timer is used.
+        /// True if custom shaders require continuous drawing.
         pub fn hasAnimations(self: *const Self) bool {
             return self.has_custom_shaders;
+        }
+
+        /// True only while a bounded discrete-wheel ease is in flight.
+        pub fn hasWheelScrollAnimation(self: *const Self) bool {
+            return self.wheel_scroll_animating;
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1609,11 +1633,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     ) catch &.{};
                 };
 
+                const mouse = state.mouse;
+                state.mouse.wheel_scroll_rows = 0;
                 break :critical .{
                     .links = links,
                     .regex_always = regex_always,
                     .regex_hover = regex_hover,
-                    .mouse = state.mouse,
+                    .mouse = mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
@@ -1715,6 +1741,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
 
+                self.updateWheelScrollAnimation(
+                    critical.mouse.wheel_scroll_rows,
+                    self.terminal_state.screen == .primary,
+                );
+
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
@@ -1788,10 +1819,59 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.font_shaper.endFrame();
         }
 
+        fn resetWheelScrollAnimation(self: *Self) void {
+            self.wheel_scroll_offset_y = 0;
+            self.wheel_scroll_start_offset_y = 0;
+            self.wheel_scroll_start_time = null;
+            self.wheel_scroll_animating = false;
+        }
+
+        fn updateWheelScrollAnimation(
+            self: *Self,
+            rows: isize,
+            primary_screen: bool,
+        ) void {
+            if (!self.config.pixel_scroll or
+                !primary_screen or
+                self.config.scroll_animation_duration <= 0)
+            {
+                self.resetWheelScrollAnimation();
+                return;
+            }
+            if (rows == 0) return;
+
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            const row_delta: f32 = @floatFromInt(std.math.clamp(rows, -1, 1));
+            self.wheel_scroll_offset_y = std.math.clamp(
+                self.wheel_scroll_offset_y + row_delta * cell_h,
+                -cell_h,
+                cell_h,
+            );
+            self.wheel_scroll_start_offset_y = self.wheel_scroll_offset_y;
+            self.wheel_scroll_start_time = .now(global.io(), .awake);
+            self.wheel_scroll_animating = self.wheel_scroll_offset_y != 0;
+        }
+
+        fn stepWheelScrollAnimation(self: *Self) void {
+            if (!self.wheel_scroll_animating) return;
+            const start = self.wheel_scroll_start_time orelse {
+                self.resetWheelScrollAnimation();
+                return;
+            };
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const elapsed_ns: f32 = @floatFromInt(start.durationTo(now).nanoseconds);
+            const elapsed_s = elapsed_ns / @as(f32, std.time.ns_per_s);
+            self.wheel_scroll_offset_y = wheelScrollEase(
+                self.wheel_scroll_start_offset_y,
+                elapsed_s,
+                self.config.scroll_animation_duration,
+            );
+            if (self.wheel_scroll_offset_y == 0) {
+                self.resetWheelScrollAnimation();
+            }
+        }
+
         /// Draw the frame to the screen.
-        ///
-        /// If `sync` is true, this will synchronously block until
-        /// the frame is finished drawing and has been presented.
         pub fn drawFrame(
             self: *Self,
             sync: bool,
@@ -1852,6 +1932,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // then drawing is absurd, so we just return.
             if (surface_size.width == 0 or surface_size.height == 0) return null;
 
+            self.stepWheelScrollAnimation();
+            self.uniforms.pixel_scroll_offset_y = self.pixelScrollUniform();
+
             const size_changed =
                 self.size.screen.width != surface_size.width or
                 self.size.screen.height != surface_size.height;
@@ -1862,6 +1945,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 size_changed or
                 self.cells_rebuilt or
                 self.hasAnimations() or
+                self.hasWheelScrollAnimation() or
                 sync;
 
             if (!needs_redraw) {
@@ -2801,7 +2885,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (!self.pixelScrollRows()) return 0;
 
             return @floatCast(renderer.size.pixelScrollShift(
-                self.pixel_scroll_offset,
+                self.pixel_scroll_offset + self.wheel_scroll_offset_y,
                 @floatFromInt(self.grid_metrics.cell_height),
             ));
         }
@@ -4113,4 +4197,19 @@ test "renderer realization rolls back failure and redraws cached frame on commit
     try testing.expectEqual(@as(usize, 2), api.realized);
     try testing.expectEqual(@as(usize, 1), api.rolled_back);
     try testing.expect(cached_frame_redraw);
+}
+
+test "wheel scroll ease is monotonic and never recoils" {
+    const testing = std.testing;
+    const start: f32 = 20;
+    var previous = start;
+    for (1..10) |i| {
+        const elapsed: f32 = @as(f32, @floatFromInt(i)) * 0.01;
+        const value = wheelScrollEase(start, elapsed, 0.12);
+        try testing.expect(value >= 0);
+        try testing.expect(value <= previous);
+        previous = value;
+    }
+    try testing.expectEqual(@as(f32, 0), wheelScrollEase(start, 0.12, 0.12));
+    try testing.expect(wheelScrollEase(-start, 0.04, 0.12) < 0);
 }

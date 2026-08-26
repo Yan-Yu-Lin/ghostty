@@ -1,5 +1,8 @@
 #include "common.glsl"
 
+// Position the origin to the upper left for extra-row clipping.
+layout(origin_upper_left) in vec4 gl_FragCoord;
+
 layout(binding = 0) uniform sampler2DRect atlas_grayscale;
 layout(binding = 1) uniform sampler2DRect atlas_color;
 
@@ -18,6 +21,17 @@ const uint ATLAS_COLOR = 1u;
 layout(location = 0) out vec4 out_FragColor;
 
 void main() {
+    // Glyphs from the two extra rows may extend beyond the terminal grid.
+    // Clip them so they never draw into the window padding.
+    if (pixel_scroll_offset_y > 0.0) {
+        uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
+        float grid_top = grid_padding.x;
+        float grid_bottom = grid_top + float(int(grid_size.y) - 2) * cell_size.y;
+        if (gl_FragCoord.y < grid_top || gl_FragCoord.y >= grid_bottom) {
+            discard;
+        }
+    }
+
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
 

@@ -105,6 +105,10 @@ void main() {
     // Calculate the final position of the cell which uses our glyph size
     // and glyph offset to create the correct bounding box for the glyph.
     cell_pos = cell_pos + size * corner + offset;
+    // Shift the two-extra-row grid into place. Round Y afterwards so glyphs
+    // remain crisp while the sub-row offset changes.
+    cell_pos.y -= pixel_scroll_offset_y;
+    cell_pos.y = round(cell_pos.y);
     gl_Position = projection_matrix * vec4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
 
     // Calculate the texture coordinate in pixels. This is NOT normalized

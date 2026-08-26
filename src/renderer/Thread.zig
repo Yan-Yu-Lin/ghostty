@@ -1351,18 +1351,21 @@ fn setQosClass(self: *const Thread) void {
 
 fn syncDrawTimer(self: *Thread) void {
     skip: {
-        // If our renderer supports animations and has them, then we
-        // can apply draw timer based on custom shader animation configuration.
+        // Wheel glides are bounded renderer work and must not inherit the
+        // decorative custom-shader animation preference.
+        if (@hasDecl(rendererpkg.Renderer, "hasWheelScrollAnimation") and
+            self.flags.visible and
+            self.renderer.hasWheelScrollAnimation())
+        {
+            break :skip;
+        }
+
         if (@hasDecl(rendererpkg.Renderer, "hasAnimations") and
             self.renderer.hasAnimations())
         {
-            // If our config says to always animate, we do so.
             switch (self.config.custom_shader_animation) {
-                // Always animate
                 .always => break :skip,
-                // Only when focused
                 .true => if (self.flags.focused) break :skip,
-                // Never animate
                 .false => {},
             }
         }
@@ -2019,6 +2022,7 @@ fn drawCallback(
         return .disarm;
     }
     _ = t.drawFrame(false);
+    t.syncDrawTimer();
 
     // Only continue if we're still active
     if (t.draw_active) {
@@ -2056,6 +2060,7 @@ fn renderCallback(
 
     // Draw
     _ = t.drawFrame(false);
+    t.syncDrawTimer();
 
     return .disarm;
 }

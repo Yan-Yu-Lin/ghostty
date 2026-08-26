@@ -933,6 +933,12 @@ palette: Palette = .{},
 /// whole lines, as do mouse-reporting and alternate-scroll modes.
 @"pixel-scroll": bool = true,
 
+/// Duration in seconds for a discrete mouse-wheel notch to glide into place
+/// on primary-screen scrollback. This is a monotonic ease-out, not a spring:
+/// it cannot overshoot or recoil. Precision scrolling remains direct, and
+/// alternate-screen applications remain line-based. Set to 0 to disable.
+@"scroll-animation-duration": f32 = 0.12,
+
 /// When to scroll the surface to the bottom. The format of this is a list of
 /// options to enable separated by commas. If you prefix an option with `no-`
 /// then it is disabled. If you omit an option, its default value is used.

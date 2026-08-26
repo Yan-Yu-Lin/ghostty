@@ -12,7 +12,19 @@ layout(binding = 1, std430) readonly buffer bg_cells {
 
 vec4 cell_bg() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
-    ivec2 grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+    bool has_extra_rows = pixel_scroll_offset_y > 0.0;
+    int first_row = has_extra_rows ? 1 : 0;
+    int last_row = int(grid_size.y) - 1 - (has_extra_rows ? 1 : 0);
+
+    vec2 scrolled_pos = gl_FragCoord.xy;
+    scrolled_pos.y += pixel_scroll_offset_y;
+    ivec2 grid_pos = ivec2(floor((scrolled_pos - grid_padding.wx) / cell_size));
+    int visible_rows = last_row - first_row + 1;
+    int unshifted_row = int(floor(
+        (gl_FragCoord.y - grid_padding.x) / cell_size.y
+    ));
+    bool above_grid = unshifted_row < 0;
+    bool below_grid = unshifted_row >= visible_rows;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
     vec4 bg = vec4(0.0);
@@ -32,19 +44,23 @@ vec4 cell_bg() {
         }
     }
 
-    // Clamp y position if we should extend, otherwise discard if out of bounds.
-    if (grid_pos.y < 0) {
+    // Vertical padding extends from the visible viewport edge, never from
+    // either extra row. Inside the terminal area, clamp only for safety at
+    // the extreme ends of the sub-row offset range.
+    if (above_grid) {
         if ((padding_extend & EXTEND_UP) != 0) {
-            grid_pos.y = 0;
+            grid_pos.y = first_row;
         } else {
             return bg;
         }
-    } else if (grid_pos.y > grid_size.y - 1) {
+    } else if (below_grid) {
         if ((padding_extend & EXTEND_DOWN) != 0) {
-            grid_pos.y = int(grid_size.y) - 1;
+            grid_pos.y = last_row;
         } else {
             return bg;
         }
+    } else {
+        grid_pos.y = clamp(grid_pos.y, 0, int(grid_size.y) - 1);
     }
 
     // Load the color for the cell.

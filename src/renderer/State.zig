@@ -127,6 +127,11 @@ pub const Mouse = struct {
     ///
     /// See `Surface.Mouse.pixel_scroll_offset` for the producer side.
     pixel_scroll_offset_y: f32 = 0,
+
+    /// Whole viewport rows consumed from discrete wheel input since the last
+    /// renderer update. This is a one-shot handoff used to preserve the
+    /// pre-scroll visual position while the new row glides into place.
+    wheel_scroll_rows: isize = 0,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.

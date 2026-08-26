@@ -5377,7 +5377,7 @@ pub fn scrollCallback(
         // many pixels. The viewport still moves a row at a time; the
         // remainder is what makes the motion continuous.
         if (self.pixelScrollActive()) {
-            self.applyPixelScroll(pixel_yoff);
+            self.applyPixelScroll(pixel_yoff, !scroll_mods.precision);
         } else {
             // Any offset we were holding is no longer meaningful.
             self.resetPixelScroll();
@@ -5412,12 +5412,13 @@ fn pixelScrollActive(self: *const Surface) bool {
 
 /// Accumulate a pixel scroll delta, moving the viewport by whole rows as
 /// the accumulator crosses cell boundaries and publishing the sub-row
-/// remainder to the renderer.
+/// remainder to the renderer. Discrete wheel row crossings are also
+/// published as a one-shot glide request; precision input stays direct.
 ///
 /// `delta` is in pixels, positive up (matching the raw scroll offset).
 ///
 /// Precondition: the renderer_state mutex must be held.
-fn applyPixelScroll(self: *Surface, delta: f64) void {
+fn applyPixelScroll(self: *Surface, delta: f64, animate_discrete: bool) void {
     if (delta == 0) return;
 
     const cell_height: f64 = @floatFromInt(self.size.cell.height);
@@ -5444,6 +5445,9 @@ fn applyPixelScroll(self: *Surface, delta: f64) void {
 
     if (step.rows != 0) {
         self.io.terminal.scrollViewport(.{ .delta = step.rows });
+        if (animate_discrete) {
+            self.renderer_state.mouse.wheel_scroll_rows += step.rows;
+        }
     }
 
     self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(-step.remainder);

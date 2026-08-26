@@ -22,9 +22,8 @@ layout(binding = 1, std140) uniform Globals {
     uniform uint cursor_pos_packed_2u16;
     uniform uint cursor_color_packed_4u8;
     uniform uint bg_color_packed_4u8;
-    // Vertical shift for pixel scrolling. The GLSL path does not
-    // implement pixel scrolling, so this is always zero; it is declared
-    // only to keep this block's layout matching the Zig Uniforms struct.
+    // Vertical grid shift for primary-screen pixel scrolling. A positive
+    // value hides the extra row above the viewport and reveals sub-row motion.
     uniform float pixel_scroll_offset_y;
     uniform uint bools;
 };
