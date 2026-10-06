@@ -1612,9 +1612,12 @@ test "Uniforms layout matches the MSL definition" {
     try testing.expectEqual(96, @offsetOf(Uniforms, "grid_padding"));
     try testing.expectEqual(112, @offsetOf(Uniforms, "padding_extend"));
     try testing.expectEqual(116, @offsetOf(Uniforms, "min_contrast"));
-    try testing.expectEqual(120, @offsetOf(Uniforms, "cursor_pos"));
-    try testing.expectEqual(124, @offsetOf(Uniforms, "cursor_color"));
-    try testing.expectEqual(128, @offsetOf(Uniforms, "bg_color"));
-    try testing.expectEqual(132, @offsetOf(Uniforms, "pixel_scroll_offset_y"));
-    try testing.expectEqual(136, @offsetOf(Uniforms, "bools"));
+    // Upstream cmux's fractional scroll offset (added in Ghostty 39ade10b6).
+    // Offsets below were re-probed on-device for the v0.65.0 port.
+    try testing.expectEqual(120, @offsetOf(Uniforms, "scroll_offset"));
+    try testing.expectEqual(124, @offsetOf(Uniforms, "cursor_pos"));
+    try testing.expectEqual(128, @offsetOf(Uniforms, "cursor_color"));
+    try testing.expectEqual(132, @offsetOf(Uniforms, "bg_color"));
+    try testing.expectEqual(136, @offsetOf(Uniforms, "pixel_scroll_offset_y"));
+    try testing.expectEqual(140, @offsetOf(Uniforms, "bools"));
 }
